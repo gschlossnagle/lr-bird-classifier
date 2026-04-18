@@ -294,12 +294,19 @@ Classifier-Confidence hierarchies) from the catalog:
 # Remove all auto-tags from every classified image
 .venv/bin/python -m src.wipe /path/to/catalog.lrcat
 
+# Limit to a specific folder (same matching rules as --folder in src.run)
+.venv/bin/python -m src.wipe /path/to/catalog.lrcat --folder "2024/Costa Rica"
+.venv/bin/python -m src.wipe /path/to/catalog.lrcat --folder /Volumes/FastDrive/Photos/Birds
+
 # Remove only images whose best confidence was below 50%
 .venv/bin/python -m src.wipe /path/to/catalog.lrcat --below-confidence 0.5
 
+# Combine folder and confidence filters
+.venv/bin/python -m src.wipe /path/to/catalog.lrcat --folder "2024" --below-confidence 0.5
+
 # Preview what would be removed without writing anything
 .venv/bin/python -m src.wipe /path/to/catalog.lrcat --dry-run
-.venv/bin/python -m src.wipe /path/to/catalog.lrcat --below-confidence 0.5 --dry-run
+.venv/bin/python -m src.wipe /path/to/catalog.lrcat --folder "2024" --dry-run
 ```
 
 `--below-confidence` reads the classification log (SQLite sidecar) to find

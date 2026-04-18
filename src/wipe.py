@@ -38,6 +38,15 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("catalog", help="Path to the .lrcat file")
     p.add_argument(
+        "--folder",
+        default=None,
+        help=(
+            "Limit wipe to images in this folder. "
+            "Absolute paths (starting with /) match as a prefix; "
+            "otherwise substring match against the full path."
+        ),
+    )
+    p.add_argument(
         "--below-confidence",
         type=float,
         default=None,
@@ -89,6 +98,16 @@ def main() -> int:
     with cat:
         all_classified: set[int] = cat.get_auto_classified_images()
         log.info(f"Found {len(all_classified)} auto-classified image(s) in catalog")
+
+        if args.folder:
+            folder_ids = {
+                img.id_local
+                for img in cat.get_images(folder_filter=args.folder)
+            }
+            all_classified &= folder_ids
+            log.info(
+                f"Folder filter '{args.folder}': {len(all_classified)} classified image(s) in scope"
+            )
 
         if args.below_confidence is not None:
             clf_log_path = catalog_path.with_name(
