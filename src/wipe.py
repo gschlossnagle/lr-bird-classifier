@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -186,8 +187,11 @@ def main() -> int:
             log.info("Nothing to wipe.")
             return 0
 
+        # Resolve image paths while the catalog connection is open
+        image_paths: dict[int, Path] = cat.get_image_paths(targets)
+
         # ------------------------------------------------------------------
-        # Wipe
+        # Wipe catalog keywords
         # ------------------------------------------------------------------
         wiped = skipped = 0
         for image_id in sorted(targets):
@@ -203,7 +207,54 @@ def main() -> int:
                     skipped += 1
 
         action = "Would wipe" if args.dry_run else "Wiped"
-        log.info(f"\nDone.  {action} {wiped} image(s).  Skipped {skipped}.")
+        log.info(f"Catalog: {action} {wiped} image(s).  Skipped {skipped}.")
+
+    # ------------------------------------------------------------------
+    # Clean XMP sidecars
+    # ------------------------------------------------------------------
+    from src.taxonomy import parse_label, get_order_display_name
+    from src.xmp_writer import clean_xmp_keywords
+    from src.classification_log import ClassificationLog
+
+    clf_log = ClassificationLog(catalog_path)
+    all_rows = clf_log.get_all_rows()
+    clf_log.close()
+
+    # Build per-image flat tag list from classification log rows
+    flat_per_image: dict[int, list[str]] = defaultdict(list)
+    for row in all_rows:
+        if row["image_id"] not in targets:
+            continue
+        parsed = parse_label(row.get("label") or "")
+        order_raw = parsed.get("order", "")
+        order_display = get_order_display_name(order_raw) if order_raw else ""
+        flat_per_image[row["image_id"]].extend([
+            row.get("common_name") or "",
+            order_display,
+            order_raw,
+            parsed.get("family", ""),
+            row.get("sci_name") or "",
+        ])
+
+    log.info("Cleaning XMP sidecars…")
+    xmp_cleaned = xmp_skipped = 0
+    for image_id in sorted(targets):
+        path = image_paths.get(image_id)
+        if path is None:
+            log.warning(f"  Could not resolve path for image_id={image_id}; skipping XMP")
+            xmp_skipped += 1
+            continue
+        flat = flat_per_image.get(image_id, [])
+        if clean_xmp_keywords(path, flat, dry_run=args.dry_run):
+            xmp_cleaned += 1
+        else:
+            xmp_skipped += 1
+
+    xmp_action = "Would clean" if args.dry_run else "Cleaned"
+    log.info(
+        f"XMP: {xmp_action} {xmp_cleaned} sidecar(s), "
+        f"{xmp_skipped} skipped (no sidecar or path not found)."
+    )
 
     return 0
 
