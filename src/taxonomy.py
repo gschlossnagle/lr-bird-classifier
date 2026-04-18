@@ -21,6 +21,7 @@ import requests
 log = logging.getLogger(__name__)
 
 CACHE_PATH = Path(__file__).parent.parent / "data" / "taxonomy_cache.json"
+SYNONYMS_CACHE_PATH = Path(__file__).parent.parent / "data" / "taxonomy_synonyms.json"
 INAT_API_URL = "https://api.inaturalist.org/v1/taxa"
 RATE_LIMIT_DELAY = 0.5   # seconds between API calls to be polite
 REQUEST_TIMEOUT = 10     # seconds
@@ -61,8 +62,15 @@ def parse_label(label: str) -> dict:
 # iNaturalist API lookup
 # ---------------------------------------------------------------------------
 
-def _fetch_common_name(sci_name: str) -> Optional[str]:
-    """Query iNaturalist API for the preferred common name of a species."""
+def _fetch_taxon(sci_name: str) -> tuple[Optional[str], Optional[str]]:
+    """
+    Query iNaturalist API for a species.
+
+    Returns:
+        (common_name, current_sci_name) — either may be None on failure.
+        current_sci_name differs from sci_name when iNat has reclassified the
+        species (e.g. Phalacrocorax auritus → Nannopterum auritum).
+    """
     try:
         resp = requests.get(
             INAT_API_URL,
@@ -72,10 +80,18 @@ def _fetch_common_name(sci_name: str) -> Optional[str]:
         resp.raise_for_status()
         results = resp.json().get("results", [])
         if results:
-            return results[0].get("preferred_common_name")
+            common = results[0].get("preferred_common_name")
+            current = results[0].get("name")   # current accepted sci name
+            return common, current
     except Exception as e:
         log.warning(f"iNat API lookup failed for '{sci_name}': {e}")
-    return None
+    return None, None
+
+
+def _fetch_common_name(sci_name: str) -> Optional[str]:
+    """Query iNaturalist API for the preferred common name of a species."""
+    common, _ = _fetch_taxon(sci_name)
+    return common
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +109,25 @@ def _save_cache(cache: dict[str, str]) -> None:
     CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(CACHE_PATH, "w") as f:
         json.dump(cache, f, indent=2, sort_keys=True)
+
+
+def _load_synonyms() -> dict[str, str]:
+    """Load old_sci_name → current_inat_sci_name synonym map."""
+    if SYNONYMS_CACHE_PATH.exists():
+        with open(SYNONYMS_CACHE_PATH) as f:
+            return json.load(f)
+    return {}
+
+
+def _save_synonyms(synonyms: dict[str, str]) -> None:
+    SYNONYMS_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(SYNONYMS_CACHE_PATH, "w") as f:
+        json.dump(synonyms, f, indent=2, sort_keys=True)
+
+
+def get_synonyms() -> dict[str, str]:
+    """Return the cached old→current sci name synonym map."""
+    return _load_synonyms()
 
 
 # ---------------------------------------------------------------------------
@@ -133,16 +168,23 @@ def build_label_map(
             label_map[label] = sci_name  # placeholder until fetched
 
     if fetch_missing and to_fetch:
+        synonyms = _load_synonyms()
         log.info(f"Fetching common names for {len(to_fetch)} species from iNaturalist...")
         for i, (label, sci_name) in enumerate(to_fetch):
-            common = _fetch_common_name(sci_name)
+            common, current = _fetch_taxon(sci_name)
             cache[sci_name] = common or ""
             label_map[label] = common or sci_name
+            # Record synonym if iNat has reclassified this species
+            if current and current != sci_name:
+                synonyms[sci_name] = current
+                log.debug(f"Synonym: {sci_name} → {current}")
             if (i + 1) % 50 == 0:
                 log.info(f"  {i + 1}/{len(to_fetch)} fetched, saving cache...")
                 _save_cache(cache)
+                _save_synonyms(synonyms)
             time.sleep(RATE_LIMIT_DELAY)
         _save_cache(cache)
+        _save_synonyms(synonyms)
         log.info("Done fetching common names.")
 
     return label_map
@@ -159,3 +201,21 @@ def get_common_name(label: str, label_map: Optional[dict[str, str]] = None) -> s
         return label_map[label]
     parsed = parse_label(label)
     return parsed.get("sci_name", label)
+
+
+def get_group_tag(common_name: str) -> str:
+    """
+    Derive a broad group tag from a common name by taking the last
+    space-separated word.
+
+    Examples:
+        "Bald Eagle"               → "Eagle"
+        "Double-Crested Cormorant" → "Cormorant"
+        "Barn Swallow"             → "Swallow"
+        "Roseate Spoonbill"        → "Spoonbill"
+        "Great Blue Heron"         → "Heron"
+        "Northern Cardinal"        → "Cardinal"
+    """
+    if not common_name:
+        return common_name
+    return common_name.rsplit(" ", 1)[-1]

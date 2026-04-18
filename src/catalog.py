@@ -31,6 +31,7 @@ CLASSIFIABLE_FORMATS = {"RAW", "DNG", "JPEG", "TIFF"}
 # Keyword hierarchy root that our species tags live under
 KEYWORD_ROOT_NAME = "Birds"
 KEYWORD_PARENT_NAME = "Species"
+KEYWORD_GROUP_NAME = "Group"
 
 
 @dataclass
@@ -185,6 +186,98 @@ class LightroomCatalog:
         """, (image_id,)).fetchall()
         return [r["name"] for r in rows]
 
+    def get_gps_for_image(self, image_id: int) -> Optional[tuple[float, float]]:
+        """Return (latitude, longitude) from EXIF metadata for an image, or None."""
+        row = self._conn.execute("""
+            SELECT gpsLatitude, gpsLongitude
+            FROM AgHarvestedExifMetadata
+            WHERE image = ?
+              AND gpsLatitude IS NOT NULL
+              AND gpsLongitude IS NOT NULL
+        """, (image_id,)).fetchone()
+        return (row["gpsLatitude"], row["gpsLongitude"]) if row else None
+
+    def get_first_gps(self, image_ids: list[int]) -> Optional[tuple[float, float]]:
+        """
+        Return (latitude, longitude) from the first image in *image_ids* that
+        has GPS EXIF data. Returns None if no image has GPS data.
+        """
+        if not image_ids:
+            return None
+        # Query in chunks of 500 to stay within SQLite expression limits
+        for i in range(0, len(image_ids), 500):
+            chunk = image_ids[i:i + 500]
+            placeholders = ",".join("?" * len(chunk))
+            row = self._conn.execute(f"""
+                SELECT gpsLatitude, gpsLongitude
+                FROM AgHarvestedExifMetadata
+                WHERE image IN ({placeholders})
+                  AND gpsLatitude IS NOT NULL
+                  AND gpsLongitude IS NOT NULL
+                LIMIT 1
+            """, chunk).fetchone()
+            if row:
+                return (row["gpsLatitude"], row["gpsLongitude"])
+        return None
+
+    def get_species_tagged_images(self) -> set[int]:
+        """
+        Return set of image id_locals that already have any keyword under
+        the Birds > Species hierarchy. Used for idempotency — skip these
+        images on subsequent runs.
+        """
+        species_row = self._conn.execute("""
+            SELECT k.id_local, k.genealogy
+            FROM AgLibraryKeyword k
+            JOIN AgLibraryKeyword birds ON birds.id_local = k.parent
+                AND birds.lc_name = 'birds'
+            WHERE k.lc_name = 'species'
+        """).fetchone()
+
+        if not species_row:
+            return set()
+
+        genealogy_prefix = species_row["genealogy"]
+
+        rows = self._conn.execute("""
+            SELECT DISTINCT ki.image
+            FROM AgLibraryKeywordImage ki
+            JOIN AgLibraryKeyword k ON k.id_local = ki.tag
+            WHERE k.genealogy LIKE ?
+        """, (f"{genealogy_prefix}/%",)).fetchall()
+
+        return {r["image"] for r in rows}
+
+    def get_manually_classed_images(self) -> set[int]:
+        """
+        Return set of image id_locals tagged with the 'manually classed' keyword.
+        These images are excluded from auto-classification — any manual correction
+        applied in Lightroom becomes sticky and will never be overwritten.
+        """
+        row = self._conn.execute("""
+            SELECT id_local FROM AgLibraryKeyword
+            WHERE lc_name = 'manually classed'
+            LIMIT 1
+        """).fetchone()
+
+        if not row:
+            return set()
+
+        rows = self._conn.execute("""
+            SELECT image FROM AgLibraryKeywordImage WHERE tag = ?
+        """, (row["id_local"],)).fetchall()
+
+        return {r["image"] for r in rows}
+
+    def ensure_manually_classed_keyword(self) -> int:
+        """
+        Ensure the 'manually classed' keyword exists at the top level and
+        return its id_local. Call this when writing a manual correction so
+        the keyword is available in Lightroom's keyword panel.
+        """
+        root_id = self._get_root_keyword_id()
+        return self._get_or_create_keyword("manually classed", parent_id=root_id)
+
     # ------------------------------------------------------------------
     # Writing keywords
     # ------------------------------------------------------------------
@@ -213,6 +306,20 @@ class LightroomCatalog:
 
         # Now ensure the leaf keyword
         return self._get_or_create_keyword(name, parent_id=parent_id)
+
+    def ensure_group_keyword(self, name: str) -> int:
+        """
+        Return the id_local of a group keyword *name* under Birds > Group,
+        creating the chain if needed.
+
+        E.g. ensure_group_keyword("Eagle") creates Birds > Group > Eagle.
+        """
+        if self.readonly:
+            raise RuntimeError("Catalog opened in read-only mode")
+        root_id = self._get_root_keyword_id()
+        birds_id = self._get_or_create_keyword(KEYWORD_ROOT_NAME, parent_id=root_id)
+        group_id = self._get_or_create_keyword(KEYWORD_GROUP_NAME, parent_id=birds_id)
+        return self._get_or_create_keyword(name, parent_id=group_id)
 
     def _ensure_keyword_chain(self) -> int:
         """Create Birds > Species hierarchy if missing, return Species id."""

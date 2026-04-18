@@ -9,6 +9,7 @@ imageio
 
 # Taxonomy / API
 requests
+reverse_geocoder
 
 # Dev / test
 pytest
