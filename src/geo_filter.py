@@ -26,14 +26,15 @@ log = logging.getLogger(__name__)
 DATA_DIR = Path(__file__).parent.parent / "data" / "region_species"
 
 # iNaturalist place IDs for broad regions
+# Verified against https://api.inaturalist.org/v1/places/{id}
 REGION_PLACE_IDS: dict[str, int] = {
-    "north_america":   97394,
-    "central_america": 97393,
-    "south_america":   97391,
-    "europe":          97392,
-    "africa":          24,
-    "asia":            97395,
-    "oceania":         97396,
+    "north_america":   97394,   # North America (continent)
+    "central_america": 143141,  # Central America
+    "south_america":   97389,   # South America
+    "europe":          97391,   # Europe
+    "africa":          97392,   # Africa
+    "asia":            97395,   # Asia
+    "oceania":         97393,   # Oceania
 }
 
 # ISO 3166-1 alpha-2 country code → region name
