@@ -1,0 +1,15 @@
+# Core CV / ML
+birder @ git+https://github.com/gschlossnagle/birder.git
+torch>=2.10.0
+torchvision
+
+# RAW image support
+rawpy
+imageio
+
+# Taxonomy / API
+requests
+
+# Dev / test
+pytest
+parameterized
