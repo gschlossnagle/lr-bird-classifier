@@ -499,6 +499,14 @@ contribute its own keywords to the same image. This is deferred as future work.
 In the meantime, use the `manually classed` keyword to lock any mis-tagged
 multi-bird images so they are not overwritten on subsequent runs.
 
+### Platform support
+
+Currently this is only tested on MacOS, though presumably Linux should work fine as well (if you can run LR there).  Windows is untested.
+
+### Evaluate alternative models/ ensemble strategies
+
+The classifier currently uses a single model currently and the recommended model was the result of rather brief testing on a small corpus.  I'd like to do more comprehensive testing on models as well as offer up the ability to use an ensemble model to reduce misclassifications.
+
 ---
 
 ## Licenses
