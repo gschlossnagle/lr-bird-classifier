@@ -177,6 +177,24 @@ class ClassificationLog:
             ).fetchall()
         return {r["image_id"] for r in rows}
 
+    def get_all_rows(self) -> list[dict]:
+        """
+        Return every row in the classifications table as a list of dicts
+        with keys: image_id, label, common_name, sci_name, confidence.
+        """
+        rows = self._conn.execute(
+            "SELECT image_id, label, common_name, sci_name, confidence FROM classifications"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def update_common_name(self, image_id: int, label: str, new_common_name: str) -> None:
+        """Update the stored common_name for a specific (image_id, label) row."""
+        self._conn.execute(
+            "UPDATE classifications SET common_name = ? WHERE image_id = ? AND label = ?",
+            (new_common_name, image_id, label),
+        )
+        self._conn.commit()
+
     def get_confidence(self, image_id: int) -> float | None:
         """Return the best recorded confidence for *image_id*, or None."""
         row = self._conn.execute(

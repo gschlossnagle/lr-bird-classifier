@@ -224,6 +224,17 @@ class LightroomCatalog:
 
         return images
 
+    def find_keyword_id(self, name: str, parent_id: int) -> int | None:
+        """
+        Return the id_local of keyword *name* under *parent_id*, or None if
+        it does not exist.  Unlike _get_or_create_keyword, this never creates.
+        """
+        row = self._conn.execute(
+            "SELECT id_local FROM AgLibraryKeyword WHERE lc_name = ? AND parent = ?",
+            (name.lower(), parent_id),
+        ).fetchone()
+        return row["id_local"] if row else None
+
     def get_keywords_for_image(self, image_id: int) -> list[str]:
         """Return keyword names currently applied to an image."""
         rows = self._conn.execute("""
