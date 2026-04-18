@@ -173,7 +173,7 @@ region, eliminating implausible results.  Build a whitelist before the first run
 # By ISO country code
 .venv/bin/python -m src.build_region_lists AU
 
-# All built-in regions at once (continents + US sub-regions)
+# All built-in regions at once (continents + US sub-regions + all 50 US states + DC)
 .venv/bin/python -m src.build_region_lists --all
 ```
 

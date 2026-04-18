@@ -11,7 +11,7 @@ Usage:
     python -m src.build_region_lists us_northeast
     python -m src.build_region_lists md           # individual US state
     python -m src.build_region_lists US           # ISO country code
-    python -m src.build_region_lists --all        # build all standard regions
+    python -m src.build_region_lists --all        # build all standard regions + all US states
     python -m src.build_region_lists --place-id 6803 --output australia
 """
 
@@ -38,7 +38,8 @@ PER_PAGE = 500
 RATE_LIMIT_DELAY = 1.0     # seconds between API pages
 DATA_DIR = Path(__file__).parent.parent / "data" / "region_species"
 
-# Regions built by --all (continents + US sub-regions; not individual state codes)
+# Named regions built first by --all (continents + US sub-regions).
+# After these, --all also builds individual US state whitelists (all 50 states + DC).
 STANDARD_REGIONS = [
     "north_america", "central_america", "south_america",
     "europe", "africa", "asia", "oceania",
@@ -249,9 +250,17 @@ def main() -> int:
     class_to_idx = load_model_classes()
 
     if args.all:
+        # Phase 1: continent-level and US sub-region whitelists
         for region in STANDARD_REGIONS:
             place_id = REGION_PLACE_IDS[region]
             build_region(region, place_id, class_to_idx)
+            time.sleep(2.0)
+        # Phase 2: individual US state whitelists (all 50 states + DC)
+        log.info("Building individual US state whitelists...")
+        for abbrev in sorted(US_STATE_ABBREV):
+            code = abbrev.lower()
+            place_id = REGION_PLACE_IDS[code]
+            build_region(code, place_id, class_to_idx)
             time.sleep(2.0)
         return 0
 
