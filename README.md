@@ -18,6 +18,9 @@ out gradually and verify results before committing to the whole archive.
 > **Always back up your catalog before running** (the tool can do this
 > automatically).  Never run it while Lightroom is open.
 
+This project builds on the [birder-project/birder](https://github.com/birder-project/birder)
+library for the heavy lifting of bird classification.  Big thanks to Ofer Hasson.
+
 ## What it does
 
 For each untagged RAW/DNG (or TIFF, PSD, PSB) bird photo the script:
