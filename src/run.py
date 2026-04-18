@@ -74,6 +74,16 @@ def parse_args() -> argparse.Namespace:
         help="Number of top predictions to tag per image (default: 1)",
     )
     p.add_argument(
+        "--min-stars",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Only classify images with a Lightroom star rating of at least N (1–5). "
+            "Unrated images are excluded when this option is set."
+        ),
+    )
+    p.add_argument(
         "--dry-run",
         action="store_true",
         help="Classify but do not write to the catalog",
@@ -217,6 +227,7 @@ def main() -> int:
         images = cat.get_images(
             formats=formats,
             folder_filter=args.folder,
+            min_rating=args.min_stars,
             limit=args.limit,
         )
         log.info(f"Found {len(images)} images to classify")

@@ -148,6 +148,7 @@ class LightroomCatalog:
         *,
         formats: Optional[set[str]] = None,
         folder_filter: Optional[str] = None,
+        min_rating: Optional[int] = None,
         limit: Optional[int] = None,
     ) -> list[CatalogImage]:
         """
@@ -157,6 +158,8 @@ class LightroomCatalog:
             formats: set of file format strings to include, e.g. {"RAW", "DNG"}.
                      If None, all formats are returned.
             folder_filter: only include images whose path contains this substring.
+            min_rating: only include images with a star rating >= this value (1–5).
+                        Unrated images (NULL or 0) are always excluded when set.
             limit: max number of images to return.
         """
         sql = """
@@ -182,6 +185,10 @@ class LightroomCatalog:
             placeholders = ",".join("?" * len(formats))
             sql += f" AND i.fileFormat IN ({placeholders})"
             params.extend(formats)
+
+        if min_rating is not None:
+            sql += " AND i.rating >= ?"
+            params.append(int(min_rating))
 
         if folder_filter:
             sql += " AND (rf.absolutePath || fo.pathFromRoot) LIKE ?"

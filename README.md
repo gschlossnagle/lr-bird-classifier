@@ -150,6 +150,9 @@ catalog and concurrent writes will be lost or corrupt it.
 
 # Remap a volume that moved between runs
 .venv/bin/python -m src.run catalog.lrcat --remap /Volumes/OldDrive:/Volumes/NewDrive
+
+# Only classify 3-star-and-above images
+.venv/bin/python -m src.run catalog.lrcat --min-stars 3
 ```
 
 ### All options
@@ -163,6 +166,8 @@ options:
                         Add PSD for Photoshop documents.
   --folder FOLDER       Filter by folder path. Absolute paths (starting with /)
                         match as a prefix; otherwise substring match.
+  --min-stars N         Only classify images with a Lightroom star rating of at
+                        least N (1–5). Unrated images are excluded when set.
   --min-confidence N    Minimum confidence 0–1 to apply a keyword (default: 0.25)
   --top-k N             Number of top predictions to tag per image (default: 1)
   --dry-run             Classify but do not write to the catalog
