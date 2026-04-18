@@ -26,6 +26,9 @@ Birds
         └── Accipitriformes               ← order tagged
               └── Accipitridae            ← family tagged
                     └── Haliaeetus leucocephalus  ← species tagged
+
+Classifier-Confidence
+  └── High                                ← confidence band tagged (see below)
 ```
 
 4. Keeps any co-located `.xmp` sidecar in sync via exiftool so Lightroom does
@@ -142,6 +145,9 @@ catalog and concurrent writes will be lost or corrupt it.
 # Re-classify images that were already auto-tagged
 .venv/bin/python -m src.run catalog.lrcat --no-skip-tagged
 
+# Re-classify only images whose recorded confidence was below 50%
+.venv/bin/python -m src.run catalog.lrcat --retag-below-confidence 0.5
+
 # Remap a volume that moved between runs
 .venv/bin/python -m src.run catalog.lrcat --remap /Volumes/OldDrive:/Volumes/NewDrive
 ```
@@ -167,6 +173,10 @@ options:
                         (north_america, europe, US, GB, AU, …)
   --no-geo-filter       Disable geographic species filtering entirely
   --no-skip-tagged      Re-classify images that already have species keywords
+  --retag-below-confidence N
+                        Re-classify images whose previously recorded best
+                        confidence is below N. Old keywords are removed first.
+                        Requires a classification log from a prior run.
   -v, --verbose         Debug logging
 ```
 
@@ -184,6 +194,42 @@ options:
 Lightroom stores ORF, ARW, CR2 etc. with `fileFormat = 'RAW'`, so all of these
 are included when you pass `--formats RAW`.  PSD and PSB both appear as
 `fileFormat = 'PSD'`.
+
+---
+
+## Confidence scoring
+
+Every classification is recorded in a SQLite log co-located with the catalog:
+
+```
+/path/to/Catalog.lrcat
+/path/to/Catalog_lr_classifier.sqlite   ← auto-created on first run
+```
+
+The log stores the model name, timestamp, species label, and raw confidence
+score (0.0–1.0) for every prediction that was written to the catalog.
+
+A `Classifier-Confidence` keyword is also written directly to the catalog,
+enabling Lightroom smart collection filtering without leaving LR:
+
+| Keyword | Confidence range |
+|---------|-----------------|
+| Very High | ≥ 90% |
+| High | ≥ 75% |
+| Medium | ≥ 50% |
+| Low | ≥ 25% |
+| Very Low | < 25% |
+
+**Example smart collection rule:** `Keywords  |  contain all  |  Classifier-Confidence/Very Low`
+
+After each run a confidence distribution summary is printed:
+
+```
+Confidence (all-time):  mean=78%  ≥90%=41%  ≥75%=29%  ≥50%=22%  <50%=8%  (312 images)
+```
+
+Use `--retag-below-confidence` to re-run classification on weak results after
+a model update — old keywords are automatically removed before re-tagging.
 
 ---
 
@@ -238,6 +284,7 @@ src/
   raw_utils.py         Image loading (RAW via rawpy, PSD via exiftool, rest via Pillow)
   preview.py           JPEG preview extraction from PSD/PSB via exiftool
   xmp_writer.py        XMP sidecar keyword sync via exiftool
+  classification_log.py  Per-image confidence log (SQLite, co-located with catalog)
 
 data/
   taxonomy_cache.json          iNat scientific name → common name (auto-populated)
@@ -247,6 +294,8 @@ data/
     north_america.json         Per-region species whitelists (built manually)
     europe.json
     …
+
+/path/to/Catalog_lr_classifier.sqlite   ← classification log, created alongside catalog
 
 models/
   rope_vit_reg4_b14_capi-inat21.pt   Downloaded model weights (not in repo)
