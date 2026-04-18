@@ -295,6 +295,37 @@ class LightroomCatalog:
 
         return {r["image"] for r in rows}
 
+    def get_auto_classified_images(self) -> set[int]:
+        """
+        Return set of image id_locals that have any auto-classification keyword
+        (i.e. any keyword under Bird-Species, Birds, or Classifier-Confidence).
+
+        Used by the wipe command to find images to clean up.
+        """
+        root_id = self._get_root_keyword_id()
+        image_ids: set[int] = set()
+
+        for kw_name in (KEYWORD_BIRD_SPECIES, KEYWORD_ROOT_NAME, KEYWORD_CONFIDENCE):
+            row = self._conn.execute(
+                "SELECT genealogy FROM AgLibraryKeyword WHERE lc_name = ? AND parent = ?",
+                (kw_name.lower(), root_id),
+            ).fetchone()
+            if not row:
+                continue
+            prefix = row["genealogy"]
+            rows = self._conn.execute(
+                """
+                SELECT DISTINCT ki.image
+                FROM AgLibraryKeywordImage ki
+                JOIN AgLibraryKeyword k ON k.id_local = ki.tag
+                WHERE k.genealogy = ? OR k.genealogy LIKE ?
+                """,
+                (prefix, f"{prefix}/%"),
+            ).fetchall()
+            image_ids.update(r["image"] for r in rows)
+
+        return image_ids
+
     def get_manually_classed_images(self) -> set[int]:
         """
         Return set of image id_locals tagged with the 'manually classed' keyword.

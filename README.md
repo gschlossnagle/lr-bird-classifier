@@ -1,9 +1,22 @@
 # lr-bird-classifier
 
-Automatically classifies bird photos in a Lightroom Classic catalog and writes
-species keywords back into the catalog hierarchy.  A CV model identifies the
-species; taxonomy lookups translate scientific names to common names; and the
-keyword tree is built to match a photographer-friendly structure.
+Like many bird photographers, keeping up with keyword taxonomy in Lightroom
+is the least enjoyable part of the hobby — and identifying every species
+correctly in the field is harder still.  This tool tackles both problems at
+once: it scans your Lightroom Classic catalog, runs each bird photo through
+a computer-vision model to identify the species, and writes a clean
+hierarchical keyword structure back into the catalog using both common and
+scientific names.
+
+A range of options lets you target just part of your library — a specific
+folder, a minimum star rating, a confidence threshold — so you can roll it
+out gradually and verify results before committing to the whole archive.
+
+> **⚠️ Lightroom has no public API for catalog access.**  This tool reads
+> and writes the undocumented SQLite internals of your `.lrcat` file.  It
+> works reliably in practice, but this is inherently unsupported territory.
+> **Always back up your catalog before running** (the tool can do this
+> automatically).  Never run it while Lightroom is open.
 
 ## What it does
 
@@ -61,15 +74,44 @@ pip install -r requirements.txt
 
 ### Download the model
 
-The classifier uses the `rope_vit_reg4_b14` model with the `capi-inat21` tag
-from the [birder project](https://github.com/birder-project/birder).  Place
-the downloaded `.pt` file in the `models/` directory:
+Models are downloaded via the [birder project](https://github.com/birder-project/birder)
+tools, which are included in `requirements.txt`.
 
-```
-models/rope_vit_reg4_b14_capi-inat21.pt
+The default model is `rope_vit_reg4_b14` with tag `capi-inat21`:
+
+```bash
+.venv/bin/python -m birder.tools download-model rope_vit_reg4_b14_capi-inat21
 ```
 
-Refer to the birder documentation for the download command.
+This downloads `rope_vit_reg4_b14_capi-inat21.pt` into the `models/` directory.
+
+#### Using a different model
+
+Any birder pretrained classification model that was trained on iNat21 can be
+used as a drop-in replacement.  To see all available pretrained models:
+
+```bash
+.venv/bin/python -m birder.tools list-models --pretrained
+```
+
+Filter to iNat21 models:
+
+```bash
+.venv/bin/python -m birder.tools list-models --pretrained --filter '*inat21*'
+```
+
+Download and use an alternative:
+
+```bash
+# Download a lighter/faster model
+.venv/bin/python -m birder.tools download-model mvit_v2_t_il-all
+
+# Run classification with it
+.venv/bin/python -m src.run catalog.lrcat --model mvit_v2_t/il-all
+```
+
+The `--model` argument takes the birder `network/tag` form (slash-separated),
+which matches how the model file is named: `{network}_{tag}.pt`.
 
 ### Fetch species common names (first run only)
 
@@ -139,8 +181,14 @@ catalog and concurrent writes will be lost or corrupt it.
 # Include Photoshop documents alongside RAW files
 .venv/bin/python -m src.run catalog.lrcat --formats RAW,DNG,PSD
 
+# Only classify 3-star-and-above selects
+.venv/bin/python -m src.run catalog.lrcat --min-stars 3
+
 # Lower confidence threshold, tag top 3 predictions
 .venv/bin/python -m src.run catalog.lrcat --min-confidence 0.15 --top-k 3
+
+# Use an alternative model
+.venv/bin/python -m src.run catalog.lrcat --model mvit_v2_t/il-all
 
 # Re-classify images that were already auto-tagged
 .venv/bin/python -m src.run catalog.lrcat --no-skip-tagged
@@ -150,9 +198,6 @@ catalog and concurrent writes will be lost or corrupt it.
 
 # Remap a volume that moved between runs
 .venv/bin/python -m src.run catalog.lrcat --remap /Volumes/OldDrive:/Volumes/NewDrive
-
-# Only classify 3-star-and-above images
-.venv/bin/python -m src.run catalog.lrcat --min-stars 3
 ```
 
 ### All options
@@ -168,6 +213,8 @@ options:
                         match as a prefix; otherwise substring match.
   --min-stars N         Only classify images with a Lightroom star rating of at
                         least N (1–5). Unrated images are excluded when set.
+  --model NETWORK/TAG   Model to use (default: rope_vit_reg4_b14/capi-inat21).
+                        See 'python -m birder.tools list-models --pretrained'.
   --min-confidence N    Minimum confidence 0–1 to apply a keyword (default: 0.25)
   --top-k N             Number of top predictions to tag per image (default: 1)
   --dry-run             Classify but do not write to the catalog
@@ -238,6 +285,32 @@ a model update — old keywords are automatically removed before re-tagging.
 
 ---
 
+## Wiping auto-classification tags
+
+To remove all auto-classification keywords (Bird-Species, Birds, and
+Classifier-Confidence hierarchies) from the catalog:
+
+```bash
+# Remove all auto-tags from every classified image
+.venv/bin/python -m src.wipe /path/to/catalog.lrcat
+
+# Remove only images whose best confidence was below 50%
+.venv/bin/python -m src.wipe /path/to/catalog.lrcat --below-confidence 0.5
+
+# Preview what would be removed without writing anything
+.venv/bin/python -m src.wipe /path/to/catalog.lrcat --dry-run
+.venv/bin/python -m src.wipe /path/to/catalog.lrcat --below-confidence 0.5 --dry-run
+```
+
+`--below-confidence` reads the classification log (SQLite sidecar) to find
+images whose best recorded confidence falls below the given threshold.  It
+requires a prior run to have produced a log file.
+
+Keywords applied via the Lightroom keyword panel (i.e. not by this tool) are
+never touched — only the three hierarchies this tool writes are removed.
+
+---
+
 ## XMP sidecar sync
 
 When Lightroom finds that a catalog keyword differs from what is recorded in the
@@ -290,6 +363,7 @@ src/
   preview.py           JPEG preview extraction from PSD/PSB via exiftool
   xmp_writer.py        XMP sidecar keyword sync via exiftool
   classification_log.py  Per-image confidence log (SQLite, co-located with catalog)
+  wipe.py              CLI tool to remove auto-classification tags from a catalog
 
 data/
   taxonomy_cache.json          iNat scientific name → common name (auto-populated)

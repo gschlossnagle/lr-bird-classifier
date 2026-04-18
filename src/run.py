@@ -68,6 +68,16 @@ def parse_args() -> argparse.Namespace:
         help="Minimum confidence (0-1) to apply a keyword (default: 0.25)",
     )
     p.add_argument(
+        "--model",
+        default=None,
+        metavar="NETWORK/TAG",
+        help=(
+            "Model to use for classification, in 'network/tag' format "
+            "(default: rope_vit_reg4_b14/capi-inat21). "
+            "Use 'python -m birder.tools list-models --pretrained' to see available models."
+        ),
+    )
+    p.add_argument(
         "--top-k",
         type=int,
         default=1,
@@ -214,7 +224,17 @@ def main() -> int:
     )
 
     # Load classifier
-    clf = Classifier(top_k=args.top_k, birds_only=True)
+    if args.model:
+        parts = args.model.split("/", 1)
+        if len(parts) != 2:
+            log.error(
+                f"Invalid --model '{args.model}' — expected network/tag format, "
+                f"e.g. rope_vit_reg4_b14/capi-inat21"
+            )
+            return 1
+        clf = Classifier(network=parts[0], tag=parts[1], top_k=args.top_k, birds_only=True)
+    else:
+        clf = Classifier(top_k=args.top_k, birds_only=True)
 
     # Open catalog
     cat = LightroomCatalog.open(
