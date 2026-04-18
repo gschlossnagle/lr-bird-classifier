@@ -8,3 +8,7 @@ models/
 *.pt
 *.onnx
 results/
+
+# Private Claude instructions and notes (local only, never push)
+CLAUDE.md
+.claude/
