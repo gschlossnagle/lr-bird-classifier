@@ -433,9 +433,9 @@ def main() -> int:
 
             tagged += 1
 
+    summary = clf_log.confidence_summary() if not args.dry_run else {}
     clf_log.close()
 
-    summary = clf_log.confidence_summary() if not args.dry_run else {}
     log.info(
         f"\nDone.  tagged={tagged}  retagged={retagged}  no_bird={no_bird}"
         f"  skip_tagged={already}  manually_classed={manually}"
