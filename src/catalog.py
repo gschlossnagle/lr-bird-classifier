@@ -224,6 +224,39 @@ class LightroomCatalog:
 
         return images
 
+    def get_image_paths(self, image_ids: set[int]) -> dict[int, Path]:
+        """
+        Return {image_id: absolute_file_path} for the given image IDs.
+        IDs not found in the catalog are silently omitted.
+        """
+        if not image_ids:
+            return {}
+        result: dict[int, Path] = {}
+        ids = list(image_ids)
+        for i in range(0, len(ids), 500):
+            chunk = ids[i : i + 500]
+            placeholders = ",".join("?" * len(chunk))
+            rows = self._conn.execute(
+                f"""
+                SELECT i.id_local,
+                       fi.baseName, fi.extension,
+                       rf.absolutePath, fo.pathFromRoot
+                FROM   Adobe_images i
+                JOIN   AgLibraryFile       fi ON fi.id_local  = i.rootFile
+                JOIN   AgLibraryFolder     fo ON fo.id_local  = fi.folder
+                JOIN   AgLibraryRootFolder rf ON rf.id_local  = fo.rootFolder
+                WHERE  i.id_local IN ({placeholders})
+                """,
+                chunk,
+            ).fetchall()
+            for r in rows:
+                path = Path(
+                    f"{r['absolutePath']}{r['pathFromRoot']}"
+                    f"{r['baseName']}.{r['extension']}"
+                )
+                result[r["id_local"]] = path
+        return result
+
     def find_keyword_id(self, name: str, parent_id: int) -> int | None:
         """
         Return the id_local of keyword *name* under *parent_id*, or None if
@@ -684,6 +717,76 @@ class LightroomCatalog:
     # ------------------------------------------------------------------
     # Convenience stats
     # ------------------------------------------------------------------
+
+    def prune_empty_classifier_keywords(self, *, dry_run: bool = False) -> int:
+        """
+        Delete orphaned keyword nodes left behind by fix_names or other
+        rename operations.
+
+        A keyword is pruned when ALL of:
+          - it lives under a classifier-owned hierarchy
+            (Bird-Species, Birds > Order, Birds > Scientific, Birds > Species)
+          - it has no photos tagged to it (zero AgLibraryKeywordImage rows)
+          - it has no child keywords (it is a true leaf — container nodes like
+            "Order" or order-group names are never pruned even if they happen to
+            have 0 direct photo associations)
+
+        Returns the number of keyword nodes deleted (or that would be deleted in
+        dry-run mode).
+        """
+        if not dry_run and self.readonly:
+            raise RuntimeError("Catalog opened in read-only mode")
+
+        root_id = self._get_root_keyword_id()
+        prefixes: list[str] = []
+        for kw_name in (KEYWORD_BIRD_SPECIES, KEYWORD_ROOT_NAME):
+            row = self._conn.execute(
+                "SELECT genealogy FROM AgLibraryKeyword WHERE lc_name = ? AND parent = ?",
+                (kw_name.lower(), root_id),
+            ).fetchone()
+            if row:
+                prefixes.append(row["genealogy"])
+
+        if not prefixes:
+            return 0
+
+        # Collect orphan IDs: zero photos AND no children
+        orphan_ids: list[int] = []
+        for prefix in prefixes:
+            rows = self._conn.execute(
+                """
+                SELECT k.id_local, k.name
+                FROM AgLibraryKeyword k
+                WHERE (k.genealogy = ? OR k.genealogy LIKE ?)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM AgLibraryKeyword child WHERE child.parent = k.id_local
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM AgLibraryKeywordImage ki WHERE ki.tag = k.id_local
+                  )
+                """,
+                (prefix, f"{prefix}/%"),
+            ).fetchall()
+            for r in rows:
+                orphan_ids.append(r["id_local"])
+                log.debug(f"  orphan keyword: '{r['name']}' (id={r['id_local']})")
+
+        if not orphan_ids or dry_run:
+            return len(orphan_ids)
+
+        # Delete in chunks to stay within SQLite expression limits
+        deleted = 0
+        for i in range(0, len(orphan_ids), 500):
+            chunk = orphan_ids[i : i + 500]
+            placeholders = ",".join("?" * len(chunk))
+            cur = self._conn.execute(
+                f"DELETE FROM AgLibraryKeyword WHERE id_local IN ({placeholders})",
+                chunk,
+            )
+            deleted += cur.rowcount
+
+        self._conn.commit()
+        return deleted
 
     def keyword_summary(self) -> list[dict]:
         """Return all keywords with their image counts."""
