@@ -22,6 +22,7 @@ log = logging.getLogger(__name__)
 
 CACHE_PATH = Path(__file__).parent.parent / "data" / "taxonomy_cache.json"
 SYNONYMS_CACHE_PATH = Path(__file__).parent.parent / "data" / "taxonomy_synonyms.json"
+ORDER_CACHE_PATH = Path(__file__).parent.parent / "data" / "taxonomy_order_names.json"
 INAT_API_URL = "https://api.inaturalist.org/v1/taxa"
 RATE_LIMIT_DELAY = 0.5   # seconds between API calls to be polite
 REQUEST_TIMEOUT = 10     # seconds
@@ -128,6 +129,103 @@ def _save_synonyms(synonyms: dict[str, str]) -> None:
 def get_synonyms() -> dict[str, str]:
     """Return the cached old→current sci name synonym map."""
     return _load_synonyms()
+
+
+# ---------------------------------------------------------------------------
+# Order common name cache
+# ---------------------------------------------------------------------------
+
+def _load_order_cache() -> dict[str, str]:
+    if ORDER_CACHE_PATH.exists():
+        with open(ORDER_CACHE_PATH) as f:
+            return json.load(f)
+    return {}
+
+
+def _save_order_cache(cache: dict[str, str]) -> None:
+    ORDER_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(ORDER_CACHE_PATH, "w") as f:
+        json.dump(cache, f, indent=2, sort_keys=True)
+
+
+def _fetch_order_common_name(order: str) -> Optional[str]:
+    """Query iNaturalist API for the preferred common name of a taxonomic order."""
+    try:
+        resp = requests.get(
+            INAT_API_URL,
+            params={"q": order, "rank": "order", "per_page": 1},
+            timeout=REQUEST_TIMEOUT,
+        )
+        resp.raise_for_status()
+        results = resp.json().get("results", [])
+        if results:
+            return results[0].get("preferred_common_name")
+    except Exception as e:
+        log.warning(f"iNat order lookup failed for '{order}': {e}")
+    return None
+
+
+def hyphenate_common_name(name: str) -> str:
+    """
+    Convert a multi-part common name to a hyphenated keyword tag.
+
+    Strips parenthetical notes, splits on commas and conjunctions, then
+    joins each segment with hyphens (replacing internal spaces too).
+
+    Examples:
+        "Loons"                              → "Loons"
+        "Hawks, Eagles, and Kites"           → "Hawks-Eagles-Kites"
+        "Shorebirds and Allies"              → "Shorebirds-Allies"
+        "Nightjars and Allies"               → "Nightjars-Allies"
+        "Pigeons and Doves"                  → "Pigeons-Doves"
+        "New World Warblers"                 → "New-World-Warblers"
+    """
+    import re
+    # Drop parenthetical notes like "(Owls)" or "(part)"
+    name = re.sub(r"\s*\([^)]*\)", "", name).strip()
+    # Split on commas and inline conjunctions surrounded by spaces
+    parts = re.split(r",\s*|\s+(?:and|&)\s+", name)
+    # Strip leading "and"/"&" from segments that survive comma-splitting
+    # e.g. ["Hawks", "Eagles", "and Kites"] → ["Hawks", "Eagles", "Kites"]
+    leading_conj = re.compile(r"^(?:and|&)\s+", re.IGNORECASE)
+    cleaned = []
+    for p in parts:
+        p = leading_conj.sub("", p.strip())
+        if p:
+            # Replace internal spaces with hyphens (e.g. "New World" → "New-World")
+            cleaned.append(p.replace(" ", "-"))
+    return "-".join(cleaned)
+
+
+def get_order_display_name(order: str) -> str:
+    """
+    Return the display name for a bird order as a hyphenated tag.
+
+    Looks up the iNaturalist preferred common name for the order, applies
+    hyphenation, and caches the result in data/taxonomy_order_names.json.
+    Falls back to the scientific order name if no common name is found.
+
+    Examples:
+        "Gaviiformes"    → "Loons"
+        "Accipitriformes"→ "Hawks-Eagles-Kites"
+        "Passeriformes"  → "Perching-Birds"  (or whatever iNat returns)
+    """
+    cache = _load_order_cache()
+    if order in cache:
+        return cache[order]
+
+    log.debug(f"Fetching common name for order '{order}' from iNat...")
+    common = _fetch_order_common_name(order)
+    if common:
+        display = hyphenate_common_name(common)
+        log.info(f"Order: {order} → '{display}' (from '{common}')")
+    else:
+        display = order   # fallback: use scientific order name
+        log.warning(f"No common name found for order '{order}'; using scientific name")
+
+    cache[order] = display
+    _save_order_cache(cache)
+    return display
 
 
 # ---------------------------------------------------------------------------

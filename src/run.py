@@ -44,12 +44,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--formats",
         default="RAW,DNG",
-        help="Comma-separated file formats to classify (default: RAW,DNG)",
+        help=(
+            "Comma-separated file formats to classify (default: RAW,DNG). "
+            "Add PSD to include Photoshop documents — previews are extracted "
+            "via exiftool so 'Maximize Compatibility' must be enabled in PS."
+        ),
     )
     p.add_argument(
         "--folder",
         default=None,
-        help="Only classify images whose path contains this string",
+        help=(
+            "Filter images by folder path. "
+            "If it starts with '/' it is treated as an absolute path prefix "
+            "(e.g. /Volumes/FastDrive/Photos/2024/Birds) so you can target a "
+            "specific disk. Otherwise it is a substring match against the full "
+            "path (e.g. 'Birds' or '2024/Hawks')."
+        ),
     )
     p.add_argument(
         "--min-confidence",
@@ -120,7 +130,8 @@ def main() -> int:
     from src.catalog import LightroomCatalog
     from src.classifier import Classifier
     from src.geo_filter import GeoFilter, normalize_region, resolve_region_from_coords
-    from src.taxonomy import get_group_tag
+    from src.taxonomy import get_order_display_name, parse_label
+    from src.xmp_writer import write_bird_keywords
 
     catalog_path = Path(args.catalog)
     if not catalog_path.exists():
@@ -273,21 +284,48 @@ def main() -> int:
                 continue
 
             for pred in confident:
-                group = get_group_tag(pred.common_name)
+                parsed = parse_label(pred.label)
+                order = parsed.get("order", "")
+                family = parsed.get("family", "")
+                order_display = get_order_display_name(order) if order else ""
+
                 label = (
                     f"{pred.common_name} ({pred.sci_name})  {pred.confidence:.1%}"
-                    f"  [group: {group}]"
+                    f"  [{order_display} / {family}]"
                 )
                 if args.dry_run:
                     log.info(f"[{i}/{len(images)}] DRY-RUN  {path.name}  →  {label}")
                 else:
-                    # Species keyword under Birds > Species
-                    kw_id = cat.ensure_keyword(pred.common_name)
-                    newly = cat.tag_image(img.id_local, kw_id)
+                    # Quick-access keyword: Bird-Species > Bald Eagle
+                    top_id = cat.ensure_bird_species_keyword(pred.common_name)
+                    newly = cat.tag_image(img.id_local, top_id)
 
-                    # Group keyword under Birds > Group
-                    grp_id = cat.ensure_group_keyword(group)
-                    cat.tag_image(img.id_local, grp_id)
+                    # Common name nested under order:
+                    #   Birds > Order > {order_display} > {common name}
+                    ord_id, kw_id = cat.ensure_species_keyword(
+                        order_display or order, pred.common_name
+                    )
+                    cat.tag_image(img.id_local, kw_id)
+                    cat.tag_image(img.id_local, ord_id)   # also tag the order itself
+
+                    # Scientific: Birds > Scientific > {order} > {family} > {sci_name}
+                    if order and family and pred.sci_name:
+                        ord_kw_id, fam_kw_id, spc_kw_id = cat.ensure_scientific_keywords(
+                            order, family, pred.sci_name
+                        )
+                        cat.tag_image(img.id_local, ord_kw_id)
+                        cat.tag_image(img.id_local, fam_kw_id)
+                        cat.tag_image(img.id_local, spc_kw_id)
+
+                    # Keep XMP sidecar in sync so LR doesn't warn "out of sync"
+                    write_bird_keywords(
+                        path,
+                        pred.common_name,
+                        order_display or order,
+                        order,
+                        family,
+                        pred.sci_name,
+                    )
 
                     status = "TAGGED  " if newly else "EXISTING"
                     log.info(

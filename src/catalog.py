@@ -26,12 +26,16 @@ log = logging.getLogger(__name__)
 _CORE_DATA_EPOCH_OFFSET = 978307200
 
 # File formats we can run CV classification on
-CLASSIFIABLE_FORMATS = {"RAW", "DNG", "JPEG", "TIFF"}
+# Lightroom records both .psd and .psb files with fileFormat = 'PSD'.
+CLASSIFIABLE_FORMATS = {"RAW", "DNG", "JPEG", "TIFF", "PSD"}
 
 # Keyword hierarchy root that our species tags live under
 KEYWORD_ROOT_NAME = "Birds"
-KEYWORD_PARENT_NAME = "Species"
-KEYWORD_GROUP_NAME = "Group"
+KEYWORD_PARENT_NAME = "Species"         # Birds > Species > {common name}
+KEYWORD_GROUP_NAME = "Group"            # legacy – kept for back-compat
+KEYWORD_ORDER_NAME = "Order"            # Birds > Order > {common order name}
+KEYWORD_SCIENTIFIC_NAME = "Scientific"  # Birds > Scientific > {order} > {family} > {sci}
+KEYWORD_BIRD_SPECIES = "Bird-Species"   # Bird-Species > {common name}  (top-level shortcut)
 
 
 @dataclass
@@ -154,7 +158,16 @@ class LightroomCatalog:
 
         if folder_filter:
             sql += " AND (rf.absolutePath || fo.pathFromRoot) LIKE ?"
-            params.append(f"%{folder_filter}%")
+            if folder_filter.startswith("/"):
+                # Absolute path prefix: match from the start so different
+                # disks with identically-named folders can be distinguished.
+                # Append a trailing slash if not already present so that
+                # "/Volumes/Drive/Birds" doesn't also match "/Volumes/Drive/Birds2".
+                prefix = folder_filter.rstrip("/") + "/"
+                params.append(f"{prefix}%")
+            else:
+                # Substring match for short names like "Birds" or "2024/Hawks"
+                params.append(f"%{folder_filter}%")
 
         if limit:
             sql += f" LIMIT {int(limit)}"
@@ -222,22 +235,22 @@ class LightroomCatalog:
 
     def get_species_tagged_images(self) -> set[int]:
         """
-        Return set of image id_locals that already have any keyword under
-        the Birds > Species hierarchy. Used for idempotency — skip these
-        images on subsequent runs.
+        Return set of image id_locals that already have any keyword under the
+        Birds > Order hierarchy (which includes both order and species tags).
+        Used for idempotency — skip these images on subsequent runs.
         """
-        species_row = self._conn.execute("""
+        order_row = self._conn.execute("""
             SELECT k.id_local, k.genealogy
             FROM AgLibraryKeyword k
             JOIN AgLibraryKeyword birds ON birds.id_local = k.parent
                 AND birds.lc_name = 'birds'
-            WHERE k.lc_name = 'species'
+            WHERE k.lc_name = 'order'
         """).fetchone()
 
-        if not species_row:
+        if not order_row:
             return set()
 
-        genealogy_prefix = species_row["genealogy"]
+        genealogy_prefix = order_row["genealogy"]
 
         rows = self._conn.execute("""
             SELECT DISTINCT ki.image
@@ -310,9 +323,7 @@ class LightroomCatalog:
     def ensure_group_keyword(self, name: str) -> int:
         """
         Return the id_local of a group keyword *name* under Birds > Group,
-        creating the chain if needed.
-
-        E.g. ensure_group_keyword("Eagle") creates Birds > Group > Eagle.
+        creating the chain if needed.  (Legacy — prefer ensure_order_keyword.)
         """
         if self.readonly:
             raise RuntimeError("Catalog opened in read-only mode")
@@ -320,6 +331,83 @@ class LightroomCatalog:
         birds_id = self._get_or_create_keyword(KEYWORD_ROOT_NAME, parent_id=root_id)
         group_id = self._get_or_create_keyword(KEYWORD_GROUP_NAME, parent_id=birds_id)
         return self._get_or_create_keyword(name, parent_id=group_id)
+
+    def ensure_order_keyword(self, name: str) -> int:
+        """
+        Return the id_local of an order keyword *name* under Birds > Order,
+        creating the chain if needed.
+
+        E.g. ensure_order_keyword("Hawks-Eagles-Kites-Allies") creates:
+            Birds > Order > Hawks-Eagles-Kites-Allies
+        """
+        if self.readonly:
+            raise RuntimeError("Catalog opened in read-only mode")
+        root_id = self._get_root_keyword_id()
+        birds_id = self._get_or_create_keyword(KEYWORD_ROOT_NAME, parent_id=root_id)
+        order_id = self._get_or_create_keyword(KEYWORD_ORDER_NAME, parent_id=birds_id)
+        return self._get_or_create_keyword(name, parent_id=order_id)
+
+    def ensure_bird_species_keyword(self, name: str) -> int:
+        """
+        Return the id_local of a keyword *name* under the top-level
+        Bird-Species container, creating the chain if needed.
+
+        E.g. ensure_bird_species_keyword("Bald Eagle") creates:
+            Bird-Species > Bald Eagle
+        """
+        if self.readonly:
+            raise RuntimeError("Catalog opened in read-only mode")
+        root_id = self._get_root_keyword_id()
+        container_id = self._get_or_create_keyword(KEYWORD_BIRD_SPECIES, parent_id=root_id)
+        return self._get_or_create_keyword(name, parent_id=container_id)
+
+    def ensure_species_keyword(self, order_display: str, common_name: str) -> tuple[int, int]:
+        """
+        Ensure Birds > Order > {order_display} > {common_name} hierarchy exists.
+
+        Returns (order_kw_id, species_kw_id) so the caller can tag the image
+        with both the order and the species in a single call.
+
+        Example:
+            ensure_species_keyword("Hawks-Eagles-Kites-Allies", "Bald Eagle")
+            → creates (and returns ids for):
+                Birds > Order > Hawks-Eagles-Kites-Allies > Bald Eagle
+        """
+        if self.readonly:
+            raise RuntimeError("Catalog opened in read-only mode")
+        order_kw_id = self.ensure_order_keyword(order_display)
+        species_kw_id = self._get_or_create_keyword(common_name, parent_id=order_kw_id)
+        return order_kw_id, species_kw_id
+
+    def ensure_scientific_keywords(
+        self,
+        order: str,
+        family: str,
+        sci_name: str,
+    ) -> tuple[int, int, int]:
+        """
+        Ensure the full scientific hierarchy exists and return keyword ids.
+
+        Creates:
+            Birds > Scientific > {order} > {family} > {sci_name}
+
+        Returns:
+            (order_kw_id, family_kw_id, species_kw_id)
+
+        Example:
+            ensure_scientific_keywords(
+                "Accipitriformes", "Accipitridae", "Haliaeetus leucocephalus"
+            )
+        """
+        if self.readonly:
+            raise RuntimeError("Catalog opened in read-only mode")
+        root_id = self._get_root_keyword_id()
+        birds_id = self._get_or_create_keyword(KEYWORD_ROOT_NAME, parent_id=root_id)
+        sci_id = self._get_or_create_keyword(KEYWORD_SCIENTIFIC_NAME, parent_id=birds_id)
+        order_kw_id = self._get_or_create_keyword(order, parent_id=sci_id)
+        family_kw_id = self._get_or_create_keyword(family, parent_id=order_kw_id)
+        species_kw_id = self._get_or_create_keyword(sci_name, parent_id=family_kw_id)
+        return order_kw_id, family_kw_id, species_kw_id
 
     def _ensure_keyword_chain(self) -> int:
         """Create Birds > Species hierarchy if missing, return Species id."""
