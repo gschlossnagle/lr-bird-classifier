@@ -75,7 +75,28 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### Download the model
+### Quick setup
+
+After `pip install`, run the setup script to download the model, fetch species
+common names, and build all regional whitelists in one step:
+
+```bash
+bash scripts/setup.sh
+```
+
+This takes 5–15 minutes depending on your internet connection.  When it
+finishes you are ready to run:
+
+```bash
+.venv/bin/python -m src.run /path/to/catalog.lrcat --dry-run
+```
+
+### Advanced setup
+
+If you want more control — a different model, specific regions only, or a
+staged setup — you can run each step manually.
+
+#### Download the model
 
 Models are downloaded via the [birder project](https://github.com/birder-project/birder)
 tools, which are included in `requirements.txt`.
@@ -90,8 +111,8 @@ This downloads `rope_vit_reg4_b14_capi-inat21.pt` into the `models/` directory.
 
 #### Using a different model
 
-Any birder pretrained classification model that was trained on iNat21 can be
-used as a drop-in replacement.  To see all available pretrained models:
+Any birder pretrained classification model trained on iNat21 can be used as a
+drop-in replacement.  To see all available pretrained models:
 
 ```bash
 .venv/bin/python -m birder.tools list-models --pretrained
@@ -116,7 +137,7 @@ Download and use an alternative:
 The `--model` argument takes the birder `network/tag` form (slash-separated),
 which matches how the model file is named: `{network}_{tag}.pt`.
 
-### Fetch species common names (first run only)
+#### Fetch species common names (first run only)
 
 Common names are resolved from the iNaturalist API and cached locally.  Run
 once after install:
@@ -132,7 +153,7 @@ clf.fetch_common_names()
 This takes a few minutes and writes `data/taxonomy_cache.json`.  Subsequent
 runs use the cache with no network calls.
 
-### Build a regional species whitelist (recommended)
+#### Build a regional species whitelist (recommended)
 
 Geo-filtering restricts predictions to species actually observed in the photo's
 region, eliminating implausible results.  Build a whitelist before the first run:
