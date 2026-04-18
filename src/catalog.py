@@ -36,6 +36,33 @@ KEYWORD_GROUP_NAME = "Group"            # legacy – kept for back-compat
 KEYWORD_ORDER_NAME = "Order"            # Birds > Order > {common order name}
 KEYWORD_SCIENTIFIC_NAME = "Scientific"  # Birds > Scientific > {order} > {family} > {sci}
 KEYWORD_BIRD_SPECIES = "Bird-Species"   # Bird-Species > {common name}  (top-level shortcut)
+KEYWORD_CONFIDENCE = "Classifier-Confidence"  # Classifier-Confidence > {band}  (top-level)
+
+# Confidence band thresholds — ordered from highest to lowest
+_CONFIDENCE_BANDS: list[tuple[float, str]] = [
+    (0.90, "Very High"),
+    (0.75, "High"),
+    (0.50, "Medium"),
+    (0.25, "Low"),
+    (0.00, "Very Low"),
+]
+
+
+def confidence_band(score: float) -> str:
+    """
+    Return the confidence band label for *score* (0.0–1.0).
+
+    Bands:
+        Very High  ≥ 0.90
+        High       ≥ 0.75
+        Medium     ≥ 0.50
+        Low        ≥ 0.25
+        Very Low   < 0.25
+    """
+    for threshold, label in _CONFIDENCE_BANDS:
+        if score >= threshold:
+            return label
+    return "Very Low"  # unreachable but satisfies type checker
 
 
 @dataclass
@@ -347,6 +374,21 @@ class LightroomCatalog:
         order_id = self._get_or_create_keyword(KEYWORD_ORDER_NAME, parent_id=birds_id)
         return self._get_or_create_keyword(name, parent_id=order_id)
 
+    def ensure_confidence_keyword(self, band: str) -> int:
+        """
+        Return the id_local of a confidence-band keyword under
+        Classifier-Confidence, creating the chain if needed.
+
+        Example:
+            ensure_confidence_keyword("High")
+            → creates: Classifier-Confidence > High
+        """
+        if self.readonly:
+            raise RuntimeError("Catalog opened in read-only mode")
+        root_id = self._get_root_keyword_id()
+        container_id = self._get_or_create_keyword(KEYWORD_CONFIDENCE, parent_id=root_id)
+        return self._get_or_create_keyword(band, parent_id=container_id)
+
     def ensure_bird_species_keyword(self, name: str) -> int:
         """
         Return the id_local of a keyword *name* under the top-level
@@ -536,21 +578,13 @@ class LightroomCatalog:
         root_id = self._get_root_keyword_id()
         prefixes: list[str] = []
 
-        # Bird-Species > *
-        row = self._conn.execute(
-            "SELECT genealogy FROM AgLibraryKeyword WHERE lc_name = ? AND parent = ?",
-            (KEYWORD_BIRD_SPECIES.lower(), root_id),
-        ).fetchone()
-        if row:
-            prefixes.append(row["genealogy"])
-
-        # Birds > *  (covers Order and Scientific sub-trees)
-        row = self._conn.execute(
-            "SELECT genealogy FROM AgLibraryKeyword WHERE lc_name = ? AND parent = ?",
-            (KEYWORD_ROOT_NAME.lower(), root_id),
-        ).fetchone()
-        if row:
-            prefixes.append(row["genealogy"])
+        for kw_name in (KEYWORD_BIRD_SPECIES, KEYWORD_ROOT_NAME, KEYWORD_CONFIDENCE):
+            row = self._conn.execute(
+                "SELECT genealogy FROM AgLibraryKeyword WHERE lc_name = ? AND parent = ?",
+                (kw_name.lower(), root_id),
+            ).fetchone()
+            if row:
+                prefixes.append(row["genealogy"])
 
         if not prefixes:
             return 0

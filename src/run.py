@@ -176,7 +176,7 @@ def main() -> int:
         datefmt="%H:%M:%S",
     )
 
-    from src.catalog import LightroomCatalog
+    from src.catalog import LightroomCatalog, confidence_band
     from src.classification_log import ClassificationLog
     from src.classifier import Classifier
     from src.geo_filter import GeoFilter, normalize_region, resolve_region_from_coords
@@ -405,6 +405,11 @@ def main() -> int:
 
                 # Record all confident predictions in the classification log
                 clf_log.record(img.id_local, confident, clf_model_str)
+
+                # Write confidence band keyword for LR smart-collection filtering
+                best_conf = max(p.confidence for p in confident)
+                band_kw_id = cat.ensure_confidence_keyword(confidence_band(best_conf))
+                cat.tag_image(img.id_local, band_kw_id)
 
                 status = "RETAG   " if is_retag else ("TAGGED  " if newly else "EXISTING")
                 label_str = "  |  ".join(
