@@ -35,6 +35,17 @@ US sub-regions (auto-selected from GPS; also usable as --region hints):
 Individual US states (build a state-specific whitelist for maximum precision):
   Use the two-letter postal abbreviation, e.g. --region MD, --region FL
   Falls back to the parent sub-region list if no state-specific list exists.
+
+Individual countries (ISO 3166-1 alpha-2 codes):
+  --region CR   Costa Rica
+  --region JP   Japan
+  --region ZA   South Africa
+  … any code in COUNTRY_NAMES (see below)
+  Falls back to the broad continental region if no country list has been built.
+
+  Note: codes that collide with US postal abbreviations (AL, CO, ID, IL, IN,
+  LA, MA, MD, ME, MN, NE, SD) always resolve to the US state.  Use the
+  continent name (e.g. --region asia) for those countries.
 """
 
 from __future__ import annotations
@@ -208,6 +219,63 @@ COUNTRY_TO_REGION: dict[str, str] = {
     "SB": "oceania", "VU": "oceania", "WS": "oceania", "TO": "oceania",
 }
 
+# ISO 3166-1 alpha-2 country codes that get their own per-country whitelist.
+# Maps code → English name (used by build_region_lists for iNat place lookup).
+#
+# Excluded codes (always resolve to the US state of the same letters):
+#   AL CO ID IL IN LA MA MD ME MN NE SD
+# Also excluded: US (handled via state detection), CA (collides with California;
+# use --region canada instead).
+COUNTRY_NAMES: dict[str, str] = {
+    # North America (non-US/CA)
+    "GL": "Greenland", "PM": "Saint Pierre and Miquelon",
+    # Central America & Caribbean
+    "MX": "Mexico",    "GT": "Guatemala", "BZ": "Belize",   "HN": "Honduras",
+    "SV": "El Salvador", "NI": "Nicaragua", "CR": "Costa Rica", "PA": "Panama",
+    "CU": "Cuba",      "JM": "Jamaica",   "HT": "Haiti",    "DO": "Dominican Republic",
+    "PR": "Puerto Rico", "TT": "Trinidad and Tobago",
+    # South America  (CO=Colombia excluded — collides with CO=Colorado)
+    "VE": "Venezuela", "GY": "Guyana",    "SR": "Suriname", "BR": "Brazil",
+    "EC": "Ecuador",   "PE": "Peru",      "BO": "Bolivia",  "PY": "Paraguay",
+    "CL": "Chile",     "AR": "Argentina", "UY": "Uruguay",
+    # Europe  (AL=Albania, MD=Moldova, ME=Montenegro excluded)
+    "GB": "United Kingdom", "IE": "Ireland",  "FR": "France",   "ES": "Spain",
+    "PT": "Portugal",       "DE": "Germany",  "NL": "Netherlands", "BE": "Belgium",
+    "LU": "Luxembourg",     "CH": "Switzerland", "AT": "Austria", "IT": "Italy",
+    "GR": "Greece",         "DK": "Denmark",  "SE": "Sweden",   "NO": "Norway",
+    "FI": "Finland",        "IS": "Iceland",  "PL": "Poland",   "CZ": "Czech Republic",
+    "SK": "Slovakia",       "HU": "Hungary",  "RO": "Romania",  "BG": "Bulgaria",
+    "HR": "Croatia",        "SI": "Slovenia", "RS": "Serbia",   "BA": "Bosnia and Herzegovina",
+    "MK": "North Macedonia", "UA": "Ukraine", "BY": "Belarus",
+    "LT": "Lithuania",      "LV": "Latvia",   "EE": "Estonia",  "RU": "Russia",
+    # Africa  (MA=Morocco, NE=Niger, SD=Sudan excluded)
+    "DZ": "Algeria",  "TN": "Tunisia",      "LY": "Libya",        "EG": "Egypt",
+    "ET": "Ethiopia", "KE": "Kenya",         "TZ": "Tanzania",     "UG": "Uganda",
+    "RW": "Rwanda",   "NG": "Nigeria",       "GH": "Ghana",        "SN": "Senegal",
+    "ZA": "South Africa", "ZW": "Zimbabwe",  "ZM": "Zambia",       "MZ": "Mozambique",
+    "MG": "Madagascar",   "AO": "Angola",    "CM": "Cameroon",     "CI": "Cote d'Ivoire",
+    "ML": "Mali",
+    # Asia  (ID=Indonesia, IL=Israel, IN=India, LA=Laos, MN=Mongolia excluded)
+    "CN": "China",    "JP": "Japan",         "KR": "South Korea",  "TH": "Thailand",
+    "VN": "Vietnam",  "PH": "Philippines",   "MY": "Malaysia",     "SG": "Singapore",
+    "MM": "Myanmar",  "KH": "Cambodia",      "BD": "Bangladesh",   "PK": "Pakistan",
+    "AF": "Afghanistan", "IR": "Iran",        "IQ": "Iraq",         "SA": "Saudi Arabia",
+    "AE": "United Arab Emirates", "TR": "Turkey", "KZ": "Kazakhstan", "UZ": "Uzbekistan",
+    "TW": "Taiwan",   "HK": "Hong Kong",     "NP": "Nepal",        "LK": "Sri Lanka",
+    # Oceania
+    "AU": "Australia",    "NZ": "New Zealand",   "PG": "Papua New Guinea",
+    "FJ": "Fiji",         "SB": "Solomon Islands", "VU": "Vanuatu",
+    "WS": "Samoa",        "TO": "Tonga",
+}
+
+# Lowercase country code → broad continental region (for GeoFilter fallback when
+# the per-country whitelist file has not been built yet).
+_COUNTRY_CODE_TO_REGION: dict[str, str] = {
+    iso.lower(): COUNTRY_TO_REGION[iso]
+    for iso in COUNTRY_NAMES
+    if iso in COUNTRY_TO_REGION
+}
+
 
 class GeoFilter:
     """
@@ -229,15 +297,19 @@ class GeoFilter:
     def _load(self, data_dir: Path) -> None:
         path = data_dir / f"{self.region}.json"
 
-        # For US state codes, fall back to the parent sub-region if needed
-        fallback_region: Optional[str] = None
+        # Fall back to a broader region when no exact file exists.
+        # US state codes → parent sub-region (md → us_northeast).
+        # Country codes  → broad continent   (cr → central_america).
         if not path.exists():
-            fallback_region = _STATE_CODE_TO_SUBREGION.get(self.region)
+            fallback_region: Optional[str] = (
+                _STATE_CODE_TO_SUBREGION.get(self.region)
+                or _COUNTRY_CODE_TO_REGION.get(self.region)
+            )
             if fallback_region:
                 fallback_path = data_dir / f"{fallback_region}.json"
                 if fallback_path.exists():
                     log.info(
-                        f"No state-specific list for '{self.region}'; "
+                        f"No specific list for '{self.region}'; "
                         f"falling back to '{fallback_region}'"
                     )
                     path = fallback_path
@@ -304,6 +376,15 @@ def resolve_region_from_coords(lat: float, lon: float) -> str:
             log.debug(f"GPS ({lat:.4f}, {lon:.4f}) → {admin1}, CA → canada")
             return "canada"
 
+        # Non-colliding country code → return it directly so GeoFilter loads
+        # the per-country whitelist (falling back to continent if not built yet).
+        if cc in COUNTRY_NAMES:
+            log.debug(
+                f"GPS ({lat:.4f}, {lon:.4f}) → {COUNTRY_NAMES[cc]} ({cc}) → {cc.lower()}"
+            )
+            return cc.lower()
+
+        # Collision codes (IN=India, CO=Colombia, …) or unmapped → broad region
         region = COUNTRY_TO_REGION.get(cc)
         if region:
             log.debug(f"GPS ({lat:.4f}, {lon:.4f}) → country={cc} → region={region}")
@@ -328,24 +409,36 @@ def normalize_region(region: str) -> str:
 
     Accepts:
       - Named regions:  'north_america', 'us_southeast', 'alaska', …
-      - US state codes: 'MD', 'FL', 'CA', … (case-insensitive)
-      - ISO country codes for non-US countries: 'GB', 'AU', …
+      - US state codes: 'MD', 'FL', 'CA', … → lowercase key in REGION_PLACE_IDS
+        (US state always takes priority over a country with the same letters)
+      - Non-colliding ISO country codes: 'CR', 'GB', 'JP', … → 'cr', 'gb', 'jp'
+        (loads per-country whitelist; falls back to continent if not yet built)
+      - Colliding ISO codes (AL=Albania, CO=Colombia, ID=Indonesia, IL=Israel,
+        IN=India, LA=Laos, MA=Morocco, MD=Moldova, ME=Montenegro, MN=Mongolia,
+        NE=Niger, SD=Sudan): resolve to the US state of the same letters
       - 'any': disables geo filtering
     """
     if region.lower() == "any":
         return "any"
 
-    # Named region (e.g. 'north_america', 'us_pacific')
+    # Named region or US state code already in REGION_PLACE_IDS
+    # (covers 'north_america', 'us_pacific', 'md' for Maryland, etc.)
     if region.lower() in REGION_PLACE_IDS:
         return region.lower()
 
     upper = region.upper()
 
-    # US state abbreviation (e.g. 'MD' → 'md', found in REGION_PLACE_IDS)
+    # Explicit US state abbreviation check (catches upper-case input like 'MD')
     if upper in US_STATE_ABBREV:
         return upper.lower()
 
-    # ISO country code → broad region
+    # Non-colliding ISO country code → per-country whitelist key
+    if upper in COUNTRY_NAMES:
+        return upper.lower()
+
+    # Remaining ISO codes (collision codes whose US-state form isn't in
+    # REGION_PLACE_IDS for some edge case, or codes like 'US'/'CA') →
+    # fall back to the broad continental region.
     if upper in COUNTRY_TO_REGION:
         return COUNTRY_TO_REGION[upper]
 

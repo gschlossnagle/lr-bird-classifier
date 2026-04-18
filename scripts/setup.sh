@@ -40,7 +40,7 @@ fi
 echo ""
 echo -e "${BOLD}lr-bird-classifier setup${RESET}"
 echo "This will download the classification model and build lookup data."
-echo "Expect 30–90 minutes depending on your internet connection."
+echo "Expect 1–2 hours depending on your internet connection."
 
 # ── Step 1: Model ────────────────────────────────────────────────────────────
 
@@ -69,8 +69,9 @@ step "3/3  Building regional species whitelists"
 info "Writes: data/region_species/{north_america,central_america,south_america,"
 info "         europe,africa,asia,oceania,canada,alaska,hawaii,"
 info "         us_pacific,us_mountain,us_southwest,us_midwest,us_southeast,us_northeast}.json"
-info "         plus individual US state files (al, ak, az, ... wy).json"
-info "(30–60 minutes — queries iNaturalist for each region and all 51 US states)"
+info "         plus individual US state files  (al, ak, az, … wy).json"
+info "         plus individual country files   (cr, gb, jp, au, …).json"
+info "(1–2 hours — queries iNaturalist for each region, all 51 US states, and ~115 countries)"
 echo ""
 $PYTHON -m src.build_region_lists --all
 

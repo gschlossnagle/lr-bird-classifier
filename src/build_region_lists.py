@@ -11,7 +11,7 @@ Usage:
     python -m src.build_region_lists us_northeast
     python -m src.build_region_lists md           # individual US state
     python -m src.build_region_lists US           # ISO country code
-    python -m src.build_region_lists --all        # build all standard regions + all US states
+    python -m src.build_region_lists --all        # standard regions + all US states + all countries
     python -m src.build_region_lists --place-id 6803 --output australia
 """
 
@@ -27,7 +27,7 @@ from pathlib import Path
 
 import requests
 
-from .geo_filter import REGION_PLACE_IDS, normalize_region, US_STATE_ABBREV
+from .geo_filter import COUNTRY_NAMES, REGION_PLACE_IDS, normalize_region, US_STATE_ABBREV
 from .taxonomy import get_synonyms, parse_label
 
 log = logging.getLogger(__name__)
@@ -260,6 +260,20 @@ def main() -> int:
         for abbrev in sorted(US_STATE_ABBREV):
             code = abbrev.lower()
             place_id = REGION_PLACE_IDS[code]
+            build_region(code, place_id, class_to_idx)
+            time.sleep(2.0)
+
+        # Phase 3: individual country whitelists
+        log.info("Building individual country whitelists...")
+        for iso_code, country_name in sorted(COUNTRY_NAMES.items()):
+            code = iso_code.lower()
+            log.info(f"  {country_name} ({iso_code})...")
+            place_id = lookup_place_id(country_name)
+            if place_id is None:
+                log.warning(
+                    f"  Could not find iNat place for {country_name} ({iso_code}), skipping"
+                )
+                continue
             build_region(code, place_id, class_to_idx)
             time.sleep(2.0)
         return 0

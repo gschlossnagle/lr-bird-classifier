@@ -202,12 +202,15 @@ subsequent run.
 | `us_southeast` | FL, GA, SC, NC, AL, MS, LA, TN, AR |
 | `us_northeast` | ME, NH, VT, MA, RI, CT, NY, NJ, PA, MD, DE, VA, WV, DC |
 | `MD`, `FL`, `CA`, … | Any US two-letter postal abbreviation (falls back to parent sub-region if no state-specific list exists) |
-| ISO country codes | `GB`, `AU`, `MX`, … → mapped to nearest broad region |
+| `CR`, `JP`, `ZA`, `GB`, … | ISO 3166-1 alpha-2 country code — loads a per-country whitelist built by `--all` (falls back to the continent list if the country file has not been built yet) |
+
+> **Collision note:** twelve ISO codes share spelling with a US postal abbreviation (`AL` `CO` `ID` `IL` `IN` `LA` `MA` `MD` `ME` `MN` `NE` `SD`).  These always resolve to the US state.  To filter for the corresponding country (Colombia, India, etc.) use the continent name instead (e.g. `--region south_america`).
 
 When photos have GPS coordinates the region is **auto-detected** from EXIF:
-US photos resolve to the matching state sub-region; other countries use the
-broad continental region.  The `--region` flag overrides this for photos
-without GPS.
+US photos resolve to the matching state sub-region; other countries resolve to
+the per-country code (e.g. Costa Rica → `cr`) and load `cr.json`, falling back
+to the continent list when the country file has not been built.  The `--region`
+flag overrides GPS auto-detection.
 
 **Finer regions improve accuracy.**  A narrower whitelist means fewer
 plausible-but-wrong species compete for the top prediction.  In practice,
@@ -243,6 +246,9 @@ catalog and concurrent writes will be lost or corrupt it.
 
 # Use a US state abbreviation for finer-grained filtering
 .venv/bin/python -m src.run catalog.lrcat --region MD
+
+# Use an ISO country code for photos from a specific country (e.g. Costa Rica)
+.venv/bin/python -m src.run catalog.lrcat --region CR
 
 # Disable geo-filtering entirely (classify any bird worldwide)
 .venv/bin/python -m src.run catalog.lrcat --region any
@@ -299,10 +305,11 @@ options:
   --region REGION       Region hint when photos have no GPS, or to override
                         GPS-derived region. Accepts: named region
                         (north_america, us_northeast, alaska, …), US state
-                        abbreviation (MD, FL, CA, …), ISO country code
-                        (GB, AU, MX, …), or 'any' to disable geo-filtering.
-                        GPS auto-detection resolves US photos to the matching
-                        state sub-region; other countries to the broad region.
+                        abbreviation (MD, FL, CA, …), ISO country code for a
+                        per-country whitelist (CR, JP, ZA, GB, …), or 'any'
+                        to disable geo-filtering. GPS auto-detection resolves
+                        US photos to the state sub-region and other countries
+                        to their ISO code (falling back to the continent list).
   --no-geo-filter       Disable geographic species filtering entirely
   --no-skip-tagged      Re-classify images that already have species keywords
   --retag-below-confidence N
