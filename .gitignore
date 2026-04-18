@@ -12,3 +12,6 @@ results/
 # Private Claude instructions and notes (local only, never push)
 CLAUDE.md
 .claude/
+
+# Private scripts (local only, never push)
+private/
