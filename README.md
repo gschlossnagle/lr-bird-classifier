@@ -209,6 +209,15 @@ US photos resolve to the matching state sub-region; other countries use the
 broad continental region.  The `--region` flag overrides this for photos
 without GPS.
 
+**Finer regions improve accuracy.**  A narrower whitelist means fewer
+plausible-but-wrong species compete for the top prediction.  In practice,
+using `us_northeast` instead of `north_america` for a Maryland photo
+eliminates hundreds of Pacific coast and southern species from contention,
+reducing false positives noticeably — and using `md` (if you build a
+state-level whitelist) narrows it further still.  If your photos are all from
+one region, always set the most specific region that covers your shoot
+locations.
+
 ---
 
 ## Usage
