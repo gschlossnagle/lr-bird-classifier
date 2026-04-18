@@ -299,22 +299,29 @@ Classifier-Confidence hierarchies) from the catalog:
 
 # Limit to a specific folder (same matching rules as --folder in src.run)
 .venv/bin/python -m src.wipe /path/to/catalog.lrcat --folder "2024/Costa Rica"
-.venv/bin/python -m src.wipe /path/to/catalog.lrcat --folder /Volumes/FastDrive/Photos/Birds
 
-# Remove only images whose best confidence was below 50%
+# Remove only images whose best overall confidence was below 50%
 .venv/bin/python -m src.wipe /path/to/catalog.lrcat --below-confidence 0.5
 
-# Combine folder and confidence filters
-.venv/bin/python -m src.wipe /path/to/catalog.lrcat --folder "2024" --below-confidence 0.5
+# Remove a broad misclassification — all images tagged as a specific species
+.venv/bin/python -m src.wipe /path/to/catalog.lrcat --species "Penelope purpurascens"
+
+# Same, but only where the model was under 60% confident on that species
+.venv/bin/python -m src.wipe /path/to/catalog.lrcat --species "Penelope purpurascens" --below-confidence 0.6
+
+# Combine all three filters
+.venv/bin/python -m src.wipe /path/to/catalog.lrcat \
+    --species "Penelope purpurascens" --below-confidence 0.6 --folder "2024/Costa Rica"
 
 # Preview what would be removed without writing anything
-.venv/bin/python -m src.wipe /path/to/catalog.lrcat --dry-run
-.venv/bin/python -m src.wipe /path/to/catalog.lrcat --folder "2024" --dry-run
+.venv/bin/python -m src.wipe /path/to/catalog.lrcat --species "Penelope purpurascens" --dry-run
 ```
 
-`--below-confidence` reads the classification log (SQLite sidecar) to find
-images whose best recorded confidence falls below the given threshold.  It
-requires a prior run to have produced a log file.
+`--species` matches the scientific name recorded in the classification log
+(case-insensitive).  When combined with `--below-confidence`, the threshold
+applies to that specific species' confidence rather than the image's overall
+best confidence — so you can surgically remove weak identifications of one
+species without touching other tags on the same image.
 
 Keywords applied via the Lightroom keyword panel (i.e. not by this tool) are
 never touched — only the three hierarchies this tool writes are removed.

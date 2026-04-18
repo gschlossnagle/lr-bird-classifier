@@ -141,6 +141,42 @@ class ClassificationLog:
         ).fetchall()
         return {r["image_id"] for r in rows}
 
+    def get_images_for_species(
+        self,
+        sci_name: str,
+        max_confidence: float | None = None,
+    ) -> set[int]:
+        """
+        Return image_ids where *sci_name* was recorded as a prediction.
+
+        Args:
+            sci_name: scientific name to match (case-insensitive).
+            max_confidence: if set, only return images where the confidence
+                for *this specific species* was below the given threshold.
+                (Different from get_images_below_confidence, which filters
+                on the image's overall best confidence.)
+        """
+        if max_confidence is not None:
+            rows = self._conn.execute(
+                """
+                SELECT image_id
+                FROM   classifications
+                WHERE  LOWER(sci_name) = LOWER(?)
+                  AND  confidence < ?
+                """,
+                (sci_name, max_confidence),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                """
+                SELECT image_id
+                FROM   classifications
+                WHERE  LOWER(sci_name) = LOWER(?)
+                """,
+                (sci_name,),
+            ).fetchall()
+        return {r["image_id"] for r in rows}
+
     def get_confidence(self, image_id: int) -> float | None:
         """Return the best recorded confidence for *image_id*, or None."""
         row = self._conn.execute(
