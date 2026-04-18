@@ -277,6 +277,11 @@ def fetch_all_bird_common_names(
                 },
                 timeout=30,
             )
+            # iNat caps paginated results at 10 000 (500 × 20 pages).
+            # Requesting page 21+ returns 403 — treat as a normal end-of-results.
+            if resp.status_code == 403:
+                log.info(f"  Reached iNat pagination limit at page {page} (10 000 results cap) — switching to fallback.")
+                break
             resp.raise_for_status()
             data = resp.json()
             taxa = data.get("results", [])

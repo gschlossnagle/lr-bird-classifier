@@ -184,6 +184,28 @@ COUNTRY_TO_REGION: dict[str, str] = {
     "CR": "central_america", "PA": "central_america", "CU": "central_america",
     "JM": "central_america", "HT": "central_america", "DO": "central_america",
     "PR": "central_america", "TT": "central_america",
+    # Caribbean island nations not in the original list
+    "LC": "central_america",   # Saint Lucia
+    "VC": "central_america",   # Saint Vincent and the Grenadines
+    "GD": "central_america",   # Grenada
+    "BB": "central_america",   # Barbados
+    "AG": "central_america",   # Antigua and Barbuda
+    "KN": "central_america",   # Saint Kitts and Nevis
+    "DM": "central_america",   # Dominica
+    "AW": "central_america",   # Aruba
+    "CW": "central_america",   # Curaçao
+    "BQ": "central_america",   # Bonaire
+    "SX": "central_america",   # Sint Maarten
+    "MF": "central_america",   # Saint Martin
+    "GP": "central_america",   # Guadeloupe
+    "MQ": "central_america",   # Martinique
+    "BS": "central_america",   # Bahamas
+    "TC": "central_america",   # Turks and Caicos
+    "KY": "central_america",   # Cayman Islands
+    "VG": "central_america",   # British Virgin Islands
+    "VI": "central_america",   # US Virgin Islands
+    "MS": "central_america",   # Montserrat
+    "AI": "central_america",   # Anguilla
     # South America
     "CO": "south_america", "VE": "south_america", "GY": "south_america",
     "SR": "south_america", "BR": "south_america", "EC": "south_america",
@@ -234,6 +256,12 @@ COUNTRY_NAMES: dict[str, str] = {
     "SV": "El Salvador", "NI": "Nicaragua", "CR": "Costa Rica", "PA": "Panama",
     "CU": "Cuba",      "JM": "Jamaica",   "HT": "Haiti",    "DO": "Dominican Republic",
     "PR": "Puerto Rico", "TT": "Trinidad and Tobago",
+    # Caribbean island nations
+    "LC": "Saint Lucia",               "VC": "Saint Vincent and the Grenadines",
+    "GD": "Grenada",                   "BB": "Barbados",
+    "AG": "Antigua and Barbuda",       "KN": "Saint Kitts and Nevis",
+    "DM": "Dominica",                  "BS": "Bahamas",
+    "TC": "Turks and Caicos Islands",  "MS": "Montserrat",
     # South America  (CO=Colombia excluded — collides with CO=Colorado)
     "VE": "Venezuela", "GY": "Guyana",    "SR": "Suriname", "BR": "Brazil",
     "EC": "Ecuador",   "PE": "Peru",      "BO": "Bolivia",  "PY": "Paraguay",
