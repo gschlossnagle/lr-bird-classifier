@@ -1,9 +1,20 @@
 {
   "Accipitriformes": "Hawks-Eagles-Kites-Allies",
   "Anseriformes": "Waterfowl",
+  "Caprimulgiformes": "Nightjars-Allies",
+  "Cathartiformes": "New-World-Vultures",
   "Charadriiformes": "Shorebirds-Allies",
+  "Ciconiiformes": "Storks",
+  "Coraciiformes": "Rollers-Kingfishers-Allies",
   "Falconiformes": "Falcons-Caracaras",
+  "Galliformes": "Landfowl",
   "Gaviiformes": "Loons",
+  "Gruiformes": "Cranes-Rails-Allies",
   "Passeriformes": "Perching-Birds",
-  "Suliformes": "Gannets-Cormorants-Allies"
+  "Pelecaniformes": "Pelicans-Herons-Allies",
+  "Piciformes": "Woodpeckers-Allies",
+  "Psittaciformes": "Parrots",
+  "Strigiformes": "Owls",
+  "Suliformes": "Gannets-Cormorants-Allies",
+  "Trogoniformes": "Trogons-Quetzals"
 }
