@@ -119,6 +119,43 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def lightroom_is_running(catalog_path: Path) -> bool:
+    """
+    Return True if Lightroom currently has *catalog_path* open.
+
+    Lightroom writes a <catalog>.lrcat.lock file containing its app path and
+    PID while the catalog is open, and removes it on clean exit.  This is more
+    reliable than checking the process list because it is catalog-specific and
+    works regardless of how the process is named on different OS versions.
+    """
+    lock = catalog_path.with_suffix(".lrcat.lock")
+    if not lock.exists():
+        return False
+
+    # Confirm the PID recorded in the lock file is still alive.
+    # If LR crashed the lock file may be stale, so we don't want to block.
+    try:
+        text = lock.read_text().strip()
+        lines = text.splitlines()
+        if len(lines) >= 2:
+            pid = int(lines[1].strip())
+            import os
+            try:
+                os.kill(pid, 0)   # signal 0: check existence without sending a signal
+                return True        # process exists → LR really is running
+            except ProcessLookupError:
+                log.warning(
+                    f"Stale lock file found ({lock.name}) — "
+                    "Lightroom may have crashed. Proceeding anyway."
+                )
+                return False
+    except Exception:
+        pass
+
+    # Lock file exists but we couldn't parse it — be safe and block.
+    return True
+
+
 def main() -> int:
     args = parse_args()
     logging.basicConfig(
@@ -136,6 +173,13 @@ def main() -> int:
     catalog_path = Path(args.catalog)
     if not catalog_path.exists():
         log.error(f"Catalog not found: {catalog_path}")
+        return 1
+
+    if not args.dry_run and lightroom_is_running(catalog_path):
+        log.error(
+            "Lightroom is currently open. Close it before running this script — "
+            "concurrent writes will be lost or corrupt the catalog."
+        )
         return 1
 
     formats = {f.strip().upper() for f in args.formats.split(",")}
