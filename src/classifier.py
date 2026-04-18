@@ -18,7 +18,7 @@ from torchvision import transforms
 from birder.common import fs_ops
 
 from .raw_utils import load_image
-from .taxonomy import build_label_map, get_common_name
+from .taxonomy import build_label_map, fetch_all_bird_common_names, get_common_name
 
 log = logging.getLogger(__name__)
 
@@ -175,12 +175,17 @@ class Classifier:
     def fetch_common_names(self) -> None:
         """
         Populate the taxonomy cache with common names from iNaturalist.
-        Call once after first install; takes a few minutes for all 10k species.
+
+        Uses a paginated bulk query against the Aves taxon (~20 API pages)
+        rather than per-species lookups (~10 000 calls), so this completes
+        in a few minutes rather than over an hour.  Safe to re-run; already-
+        cached entries are not re-fetched.
         """
-        log.info("Fetching common names from iNaturalist API (this may take a few minutes)...")
+        fetch_all_bird_common_names(self._class_to_idx)
+        # Rebuild the in-memory label map from the now-populated cache
         self._label_map = build_label_map(
             self._class_to_idx,
             birds_only=False,
-            fetch_missing=True,
+            fetch_missing=False,
         )
         log.info("Common names fetched and cached.")

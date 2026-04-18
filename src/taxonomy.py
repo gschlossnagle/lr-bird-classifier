@@ -26,6 +26,7 @@ ORDER_CACHE_PATH = Path(__file__).parent.parent / "data" / "taxonomy_order_names
 INAT_API_URL = "https://api.inaturalist.org/v1/taxa"
 RATE_LIMIT_DELAY = 0.5   # seconds between API calls to be polite
 REQUEST_TIMEOUT = 10     # seconds
+AVES_TAXON_ID = 3        # iNaturalist taxon ID for class Aves (Birds)
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +227,108 @@ def get_order_display_name(order: str) -> str:
     cache[order] = display
     _save_order_cache(cache)
     return display
+
+
+# ---------------------------------------------------------------------------
+# Bulk bird name fetch
+# ---------------------------------------------------------------------------
+
+def fetch_all_bird_common_names(
+    class_to_idx: Optional[dict[str, int]] = None,
+) -> None:
+    """
+    Populate the taxonomy cache with common names for all bird species.
+
+    Uses a paginated bulk query against the iNaturalist Aves taxon rather
+    than per-species lookups, cutting ~10 000 individual API calls down to
+    ~20 pages.  Run once via ``Classifier.fetch_common_names()``; subsequent
+    calls only refresh entries that are missing or were previously empty.
+
+    The cache (data/taxonomy_cache.json) is written incrementally so an
+    interrupted run can be resumed without re-fetching already-cached pages.
+    Also records taxonomy synonyms for species iNat has reclassified.
+
+    Args:
+        class_to_idx: Optional model class→index dict.  When provided, any
+            bird species present in the model but absent from the bulk Aves
+            results (iNat API caps pagination at 10 000 results) will be
+            fetched individually as a fallback.
+    """
+    cache = _load_cache()
+    synonyms = _load_synonyms()
+
+    page = 1
+    per_page = 500
+    total_fetched = 0
+
+    log.info("Bulk-fetching bird common names from iNaturalist (class Aves)…")
+
+    while True:
+        log.info(f"  Page {page} …")
+        try:
+            resp = requests.get(
+                INAT_API_URL,
+                params={
+                    "taxon_id": AVES_TAXON_ID,
+                    "rank": "species",
+                    "per_page": per_page,
+                    "page": page,
+                    "order_by": "id",
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            taxa = data.get("results", [])
+            api_total = data.get("total_results", 0)
+        except Exception as e:
+            log.error(f"  Bulk taxa fetch failed on page {page}: {e}")
+            break
+
+        for taxon in taxa:
+            sci_name = taxon.get("name", "")
+            if not sci_name:
+                continue
+            cache[sci_name] = taxon.get("preferred_common_name") or ""
+            total_fetched += 1
+
+        log.info(f"    Got {len(taxa)} species (page {page}, {total_fetched}/{api_total} so far)")
+        _save_cache(cache)
+
+        if len(taxa) < per_page or (page * per_page) >= api_total:
+            break
+        page += 1
+        time.sleep(RATE_LIMIT_DELAY)
+
+    # --- Fallback: per-species lookup for model labels not found in bulk fetch ---
+    # The iNat API hard-caps paginated results at 10 000.  Any bird label in the
+    # model whose sci_name is still absent from the cache after the bulk pass gets
+    # a targeted individual lookup here.
+    if class_to_idx is not None:
+        missing = [
+            parsed["sci_name"]
+            for label in class_to_idx
+            for parsed in [parse_label(label)]
+            if parsed.get("is_bird") and parsed["sci_name"] not in cache
+        ]
+        if missing:
+            log.info(f"  Fallback: fetching {len(missing)} model species not in bulk results…")
+            for i, sci in enumerate(missing):
+                common, current = _fetch_taxon(sci)
+                cache[sci] = common or ""
+                if current and current != sci:
+                    synonyms[sci] = current
+                if (i + 1) % 20 == 0:
+                    _save_cache(cache)
+                    _save_synonyms(synonyms)
+                time.sleep(RATE_LIMIT_DELAY)
+
+    _save_cache(cache)
+    _save_synonyms(synonyms)
+    log.info(
+        f"Done. {sum(1 for v in cache.values() if v)} species with common names "
+        f"({total_fetched} from bulk Aves fetch)."
+    )
 
 
 # ---------------------------------------------------------------------------
