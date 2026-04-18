@@ -163,15 +163,51 @@ region, eliminating implausible results.  Build a whitelist before the first run
 .venv/bin/python -m src.build_region_lists north_america
 .venv/bin/python -m src.build_region_lists europe
 
+# US sub-regions
+.venv/bin/python -m src.build_region_lists us_northeast
+.venv/bin/python -m src.build_region_lists us_southeast
+
+# Individual US states (two-letter code)
+.venv/bin/python -m src.build_region_lists md
+
 # By ISO country code
 .venv/bin/python -m src.build_region_lists AU
 
-# All built-in regions at once
+# All built-in regions at once (continents + US sub-regions)
 .venv/bin/python -m src.build_region_lists --all
 ```
 
 Results are saved to `data/region_species/{region}.json` and reused on every
 subsequent run.
+
+#### Available regions
+
+| Region name | Coverage |
+|---|---|
+| `any` | No filtering — all model species pass through |
+| `north_america` | All of North America |
+| `central_america` | Central America & Caribbean |
+| `south_america` | South America |
+| `europe` | Europe |
+| `africa` | Africa |
+| `asia` | Asia |
+| `oceania` | Oceania |
+| `canada` | All of Canada |
+| `alaska` | Alaska |
+| `hawaii` | Hawaii |
+| `us_pacific` | CA, OR, WA |
+| `us_mountain` | ID, MT, WY, NV, UT, CO |
+| `us_southwest` | AZ, NM, TX, OK |
+| `us_midwest` | ND, SD, MN, NE, KS, IA, MO, WI, IL, MI, IN, OH, KY |
+| `us_southeast` | FL, GA, SC, NC, AL, MS, LA, TN, AR |
+| `us_northeast` | ME, NH, VT, MA, RI, CT, NY, NJ, PA, MD, DE, VA, WV, DC |
+| `MD`, `FL`, `CA`, … | Any US two-letter postal abbreviation (falls back to parent sub-region if no state-specific list exists) |
+| ISO country codes | `GB`, `AU`, `MX`, … → mapped to nearest broad region |
+
+When photos have GPS coordinates the region is **auto-detected** from EXIF:
+US photos resolve to the matching state sub-region; other countries use the
+broad continental region.  The `--region` flag overrides this for photos
+without GPS.
 
 ---
 
@@ -194,7 +230,13 @@ catalog and concurrent writes will be lost or corrupt it.
 .venv/bin/python -m src.run catalog.lrcat
 
 # Specify region explicitly (no GPS in photos)
-.venv/bin/python -m src.run catalog.lrcat --region US
+.venv/bin/python -m src.run catalog.lrcat --region us_northeast
+
+# Use a US state abbreviation for finer-grained filtering
+.venv/bin/python -m src.run catalog.lrcat --region MD
+
+# Disable geo-filtering entirely (classify any bird worldwide)
+.venv/bin/python -m src.run catalog.lrcat --region any
 
 # Target a specific folder (substring match)
 .venv/bin/python -m src.run catalog.lrcat --folder "2024/Birds"
@@ -245,8 +287,13 @@ options:
   --no-backup           Skip catalog backup before writing
   --limit N             Process at most N images (useful for testing)
   --remap FROM:TO       Remap a path prefix, e.g. /Volumes/Old:/Volumes/New
-  --region REGION       Region or country-code hint when photos have no GPS
-                        (north_america, europe, US, GB, AU, …)
+  --region REGION       Region hint when photos have no GPS, or to override
+                        GPS-derived region. Accepts: named region
+                        (north_america, us_northeast, alaska, …), US state
+                        abbreviation (MD, FL, CA, …), ISO country code
+                        (GB, AU, MX, …), or 'any' to disable geo-filtering.
+                        GPS auto-detection resolves US photos to the matching
+                        state sub-region; other countries to the broad region.
   --no-geo-filter       Disable geographic species filtering entirely
   --no-skip-tagged      Re-classify images that already have species keywords
   --retag-below-confidence N

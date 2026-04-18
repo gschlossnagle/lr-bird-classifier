@@ -8,8 +8,10 @@ in data/region_species/{region}.json.
 Usage:
     python -m src.build_region_lists north_america
     python -m src.build_region_lists europe
-    python -m src.build_region_lists US          # ISO country code
-    python -m src.build_region_lists --all       # build all standard regions
+    python -m src.build_region_lists us_northeast
+    python -m src.build_region_lists md           # individual US state
+    python -m src.build_region_lists US           # ISO country code
+    python -m src.build_region_lists --all        # build all standard regions
     python -m src.build_region_lists --place-id 6803 --output australia
 """
 
@@ -25,7 +27,7 @@ from pathlib import Path
 
 import requests
 
-from .geo_filter import REGION_PLACE_IDS, normalize_region
+from .geo_filter import REGION_PLACE_IDS, normalize_region, US_STATE_ABBREV
 from .taxonomy import get_synonyms, parse_label
 
 log = logging.getLogger(__name__)
@@ -35,6 +37,16 @@ AVES_TAXON_ID = 3          # iNaturalist taxon ID for Birds (Aves)
 PER_PAGE = 500
 RATE_LIMIT_DELAY = 1.0     # seconds between API pages
 DATA_DIR = Path(__file__).parent.parent / "data" / "region_species"
+
+# Regions built by --all (continents + US sub-regions; not individual state codes)
+STANDARD_REGIONS = [
+    "north_america", "central_america", "south_america",
+    "europe", "africa", "asia", "oceania",
+    "canada",
+    "alaska", "hawaii",
+    "us_pacific", "us_mountain", "us_southwest",
+    "us_midwest", "us_southeast", "us_northeast",
+]
 
 
 def fetch_bird_species_for_place(place_id: int) -> set[str]:
@@ -83,6 +95,26 @@ def fetch_bird_species_for_place(place_id: int) -> set[str]:
         time.sleep(RATE_LIMIT_DELAY)
 
     return sci_names
+
+
+def fetch_bird_species_for_region(place_ids: int | list[int]) -> set[str]:
+    """
+    Fetch all bird species for a region that may span multiple iNat places.
+
+    When *place_ids* is a list, fetches each place separately and returns the
+    union of all species — necessary for multi-state US sub-regions which have
+    no single iNat place.
+    """
+    if isinstance(place_ids, int):
+        return fetch_bird_species_for_place(place_ids)
+
+    combined: set[str] = set()
+    for i, pid in enumerate(place_ids):
+        log.info(f"  Place {i + 1}/{len(place_ids)} (id={pid})...")
+        combined |= fetch_bird_species_for_place(pid)
+        if i < len(place_ids) - 1:
+            time.sleep(RATE_LIMIT_DELAY)
+    return combined
 
 
 def match_to_labels(
@@ -145,12 +177,13 @@ def lookup_place_id(country_or_region: str) -> int | None:
     return None
 
 
-def build_region(region: str, place_id: int, class_to_idx: dict) -> None:
+def build_region(region: str, place_id: int | list[int], class_to_idx: dict) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     out_path = DATA_DIR / f"{region}.json"
 
-    log.info(f"Building species list for '{region}' (place_id={place_id})...")
-    sci_names = fetch_bird_species_for_place(place_id)
+    place_desc = place_id if isinstance(place_id, int) else f"[{len(place_id)} places]"
+    log.info(f"Building species list for '{region}' (place_id={place_desc})...")
+    sci_names = fetch_bird_species_for_region(place_id)
     labels = match_to_labels(sci_names, class_to_idx)
 
     data = {
@@ -216,7 +249,8 @@ def main() -> int:
     class_to_idx = load_model_classes()
 
     if args.all:
-        for region, place_id in REGION_PLACE_IDS.items():
+        for region in STANDARD_REGIONS:
+            place_id = REGION_PLACE_IDS[region]
             build_region(region, place_id, class_to_idx)
             time.sleep(2.0)
         return 0
@@ -232,18 +266,19 @@ def main() -> int:
 
     # Normalize region name or country code
     region = normalize_region(args.region)
-    place_id = REGION_PLACE_IDS.get(region)
+    place_id: int | list[int] | None = REGION_PLACE_IDS.get(region)
 
     if place_id is None:
-        # Try iNat place autocomplete
+        # Try iNat place autocomplete (single place lookup, returns int)
         log.info(f"No known place_id for '{region}', trying iNat autocomplete...")
-        place_id = lookup_place_id(args.region)
-        if place_id is None:
+        resolved = lookup_place_id(args.region)
+        if resolved is None:
             log.error(
                 f"Could not find a place_id for '{args.region}'. "
                 f"Try --place-id <id> with an explicit iNaturalist place ID."
             )
             return 1
+        place_id = resolved
 
     build_region(region, place_id, class_to_idx)
     return 0

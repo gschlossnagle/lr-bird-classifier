@@ -67,8 +67,9 @@ print('  Common names cached.')
 
 step "3/3  Building regional species whitelists"
 info "Writes: data/region_species/{north_america,central_america,south_america,"
-info "         europe,africa,asia,oceania}.json"
-info "(A few minutes — queries iNaturalist for each region)"
+info "         europe,africa,asia,oceania,canada,alaska,hawaii,"
+info "         us_pacific,us_mountain,us_southwest,us_midwest,us_southeast,us_northeast}.json"
+info "(Several minutes — queries iNaturalist for each region)"
 echo ""
 $PYTHON -m src.build_region_lists --all
 
