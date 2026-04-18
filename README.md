@@ -254,6 +254,24 @@ models/
 
 ---
 
+## Known limitations / future work
+
+### Multi-bird photos
+
+The classifier is a single-label model — it sees the whole frame and returns
+one probability distribution. When two species appear in the same photo it
+will typically lock onto the most prominent subject. The `--top-k` flag is a
+partial workaround (e.g. `--top-k 2 --min-confidence 0.15` may tag both when
+confidence is split), but is not reliable.
+
+The proper fix is a two-stage pipeline: an object detector to crop each
+individual bird, followed by per-crop classification. Each crop would then
+contribute its own keywords to the same image. This is deferred as future work.
+In the meantime, use the `manually classed` keyword to lock any mis-tagged
+multi-bird images so they are not overwritten on subsequent runs.
+
+---
+
 ## Licenses
 
 ### This project
