@@ -519,6 +519,67 @@ class LightroomCatalog:
         log.debug(f"Tagged image {image_id} with keyword {keyword_id}")
         return True
 
+    def remove_auto_classifications(self, image_id: int) -> int:
+        """
+        Remove all auto-classification keyword tags from *image_id*.
+
+        Deletes AgLibraryKeywordImage rows for every keyword whose genealogy
+        falls under the Bird-Species or Birds containers — i.e. everything
+        this tool writes automatically.  Manually-applied keywords outside
+        those hierarchies are untouched.
+
+        Returns the number of keyword associations removed.
+        """
+        if self.readonly:
+            raise RuntimeError("Catalog opened in read-only mode")
+
+        root_id = self._get_root_keyword_id()
+        prefixes: list[str] = []
+
+        # Bird-Species > *
+        row = self._conn.execute(
+            "SELECT genealogy FROM AgLibraryKeyword WHERE lc_name = ? AND parent = ?",
+            (KEYWORD_BIRD_SPECIES.lower(), root_id),
+        ).fetchone()
+        if row:
+            prefixes.append(row["genealogy"])
+
+        # Birds > *  (covers Order and Scientific sub-trees)
+        row = self._conn.execute(
+            "SELECT genealogy FROM AgLibraryKeyword WHERE lc_name = ? AND parent = ?",
+            (KEYWORD_ROOT_NAME.lower(), root_id),
+        ).fetchone()
+        if row:
+            prefixes.append(row["genealogy"])
+
+        if not prefixes:
+            return 0
+
+        total = 0
+        for prefix in prefixes:
+            cur = self._conn.execute(
+                """
+                DELETE FROM AgLibraryKeywordImage
+                WHERE image = ?
+                  AND tag IN (
+                      SELECT id_local FROM AgLibraryKeyword
+                      WHERE genealogy = ? OR genealogy LIKE ?
+                  )
+                """,
+                (image_id, prefix, f"{prefix}/%"),
+            )
+            total += cur.rowcount
+
+        if total:
+            self._conn.execute(
+                "UPDATE Adobe_images SET touchTime = ?, touchCount = touchCount + 1 WHERE id_local = ?",
+                (_core_data_now(), image_id),
+            )
+            self._conn.commit()
+            log.debug(f"Removed {total} auto-classification tag(s) from image {image_id}")
+
+        return total
+
     def untag_image(self, image_id: int, keyword_id: int) -> bool:
         """Remove a keyword from an image. Returns True if removed."""
         if self.readonly:

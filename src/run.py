@@ -115,6 +115,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Re-classify images that already have species keywords (default: skip them)",
     )
+    p.add_argument(
+        "--retag-below-confidence",
+        type=float,
+        default=None,
+        metavar="THRESHOLD",
+        help=(
+            "Re-classify images whose previously recorded best confidence is "
+            "below THRESHOLD (0-1).  Existing auto-classification keywords are "
+            "removed before re-tagging.  Requires a classification log from a "
+            "prior run."
+        ),
+    )
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args()
 
@@ -165,6 +177,7 @@ def main() -> int:
     )
 
     from src.catalog import LightroomCatalog
+    from src.classification_log import ClassificationLog
     from src.classifier import Classifier
     from src.geo_filter import GeoFilter, normalize_region, resolve_region_from_coords
     from src.taxonomy import get_order_display_name, parse_label
@@ -215,6 +228,22 @@ def main() -> int:
         already_tagged: set[int] = set()
         if not args.no_skip_tagged:
             already_tagged = cat.get_species_tagged_images()
+
+        # --retag-below-confidence: pull qualifying images out of already_tagged
+        clf_log = ClassificationLog(catalog_path)
+        retag_candidates: set[int] = set()
+        if args.retag_below_confidence is not None:
+            retag_candidates = clf_log.get_images_below_confidence(
+                args.retag_below_confidence
+            )
+            # Only retag images that are actually in our already_tagged set
+            # (i.e. ones we previously auto-tagged, not manually-tagged images)
+            retag_candidates &= already_tagged
+            already_tagged -= retag_candidates
+            log.info(
+                f"--retag-below-confidence {args.retag_below_confidence:.0%}: "
+                f"{len(retag_candidates)} image(s) queued for re-classification"
+            )
 
         log.info(
             f"Skipping {len(manually_classed)} manually-classed"
@@ -272,7 +301,8 @@ def main() -> int:
         # ------------------------------------------------------------------
         # Main classification loop
         # ------------------------------------------------------------------
-        tagged = skipped = geo_skipped = errors = no_bird = already = manually = 0
+        tagged = skipped = geo_skipped = errors = no_bird = already = manually = retagged = 0
+        clf_model_str = f"{clf.network}/{clf.tag}"
 
         for i, img in enumerate(images, 1):
             # Skip manually-classed images
@@ -286,6 +316,8 @@ def main() -> int:
                 log.debug(f"[{i}/{len(images)}] SKIP     {img.base_name}.{img.extension}")
                 already += 1
                 continue
+
+            is_retag = img.id_local in retag_candidates
 
             raw_path = img.file_path
             if remap_from and remap_to:
@@ -327,32 +359,32 @@ def main() -> int:
                 no_bird += 1
                 continue
 
-            for pred in confident:
-                parsed = parse_label(pred.label)
-                order = parsed.get("order", "")
-                family = parsed.get("family", "")
-                order_display = get_order_display_name(order) if order else ""
+            if not args.dry_run:
+                # Strip old auto-classification tags before re-tagging
+                if is_retag:
+                    removed = cat.remove_auto_classifications(img.id_local)
+                    log.debug(f"[{i}/{len(images)}] RETAG    removed {removed} old tag(s)")
 
-                label = (
-                    f"{pred.common_name} ({pred.sci_name})  {pred.confidence:.1%}"
-                    f"  [{order_display} / {family}]"
-                )
-                if args.dry_run:
-                    log.info(f"[{i}/{len(images)}] DRY-RUN  {path.name}  →  {label}")
-                else:
-                    # Quick-access keyword: Bird-Species > Bald Eagle
+                newly = False
+                for pred in confident:
+                    parsed = parse_label(pred.label)
+                    order = parsed.get("order", "")
+                    family = parsed.get("family", "")
+                    order_display = get_order_display_name(order) if order else ""
+
+                    # Quick-access keyword: Bird-Species > {common_name}
                     top_id = cat.ensure_bird_species_keyword(pred.common_name)
-                    newly = cat.tag_image(img.id_local, top_id)
+                    if cat.tag_image(img.id_local, top_id):
+                        newly = True
 
-                    # Common name nested under order:
-                    #   Birds > Order > {order_display} > {common name}
+                    # Birds > Order > {order_display} > {common_name}
                     ord_id, kw_id = cat.ensure_species_keyword(
                         order_display or order, pred.common_name
                     )
                     cat.tag_image(img.id_local, kw_id)
-                    cat.tag_image(img.id_local, ord_id)   # also tag the order itself
+                    cat.tag_image(img.id_local, ord_id)
 
-                    # Scientific: Birds > Scientific > {order} > {family} > {sci_name}
+                    # Birds > Scientific > {order} > {family} > {sci_name}
                     if order and family and pred.sci_name:
                         ord_kw_id, fam_kw_id, spc_kw_id = cat.ensure_scientific_keywords(
                             order, family, pred.sci_name
@@ -361,7 +393,7 @@ def main() -> int:
                         cat.tag_image(img.id_local, fam_kw_id)
                         cat.tag_image(img.id_local, spc_kw_id)
 
-                    # Keep XMP sidecar in sync so LR doesn't warn "out of sync"
+                    # Keep XMP sidecar in sync
                     write_bird_keywords(
                         path,
                         pred.common_name,
@@ -371,17 +403,48 @@ def main() -> int:
                         pred.sci_name,
                     )
 
-                    status = "TAGGED  " if newly else "EXISTING"
-                    log.info(
-                        f"[{i}/{len(images)}] {status}  {path.name}  →  {label}"
-                    )
-                tagged += 1
+                # Record all confident predictions in the classification log
+                clf_log.record(img.id_local, confident, clf_model_str)
 
+                status = "RETAG   " if is_retag else ("TAGGED  " if newly else "EXISTING")
+                label_str = "  |  ".join(
+                    f"{p.common_name} ({p.sci_name}) {p.confidence:.1%}"
+                    for p in confident
+                )
+                log.info(f"[{i}/{len(images)}] {status}  {path.name}  →  {label_str}")
+                if is_retag:
+                    retagged += 1
+            else:
+                for pred in confident:
+                    parsed = parse_label(pred.label)
+                    order = parsed.get("order", "")
+                    family = parsed.get("family", "")
+                    order_display = get_order_display_name(order) if order else ""
+                    label = (
+                        f"{pred.common_name} ({pred.sci_name})  {pred.confidence:.1%}"
+                        f"  [{order_display} / {family}]"
+                    )
+                    log.info(f"[{i}/{len(images)}] DRY-RUN  {path.name}  →  {label}")
+
+            tagged += 1
+
+    clf_log.close()
+
+    summary = clf_log.confidence_summary() if not args.dry_run else {}
     log.info(
-        f"\nDone.  tagged={tagged}  no_bird={no_bird}"
+        f"\nDone.  tagged={tagged}  retagged={retagged}  no_bird={no_bird}"
         f"  skip_tagged={already}  manually_classed={manually}"
         f"  missing={skipped}  errors={errors}"
     )
+    if summary and summary.get("total", 0) > 0:
+        log.info(
+            f"Confidence (all-time):  mean={summary['mean']:.0%}"
+            f"  ≥90%={summary['pct_above_90']:.0%}"
+            f"  ≥75%={summary['pct_above_75']:.0%}"
+            f"  ≥50%={summary['pct_above_50']:.0%}"
+            f"  <50%={summary['pct_below_50']:.0%}"
+            f"  ({summary['total']} images)"
+        )
     return 0
 
 
