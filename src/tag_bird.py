@@ -6,11 +6,12 @@ given image with the full hierarchy for the specified bird.  No model inference
 is run — this is purely a manual correction tool.
 
 Usage:
-    python src/tag_bird.py /path/to/image.arw "Bald Eagle" /path/to/catalog.lrcat
-    python src/tag_bird.py /path/to/image.arw "Bald Eagle" /path/to/catalog.lrcat --dry-run
+    python src/tag_bird.py "Bald Eagle" /path/to/catalog.lrcat /path/to/image.arw
+    python src/tag_bird.py "Bald Eagle" /path/to/catalog.lrcat img1.arw img2.arw img3.arw
+    python src/tag_bird.py "Bald Eagle" /path/to/catalog.lrcat *.arw --dry-run
 
 Partial / substring matching is supported:
-    python src/tag_bird.py img.arw thrasher catalog.lrcat
+    python src/tag_bird.py thrasher /path/to/catalog.lrcat img.arw
     → lists all thrasher species; exits without writing
 
 After writing, the image is marked "manually classed" so future auto-runs skip it.
@@ -198,13 +199,13 @@ def _existing_flat_tags(clf_log, image_id: int) -> list[str]:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
-            "Manually tag a Lightroom photo with a bird species by common name. "
-            "Replaces all existing classifier keywords in the catalog and XMP sidecar."
+            "Manually tag one or more Lightroom photos with a bird species by common name. "
+            "Replaces all existing classifier keywords in the catalog and XMP sidecars."
         )
     )
-    p.add_argument("image",       help="Path to the image file (must exist on disk)")
     p.add_argument("common_name", help="Bird common name, e.g. 'Bald Eagle'")
     p.add_argument("catalog",     help="Path to the .lrcat catalog file")
+    p.add_argument("images",      nargs="+", help="One or more image file paths")
     p.add_argument("--dry-run",   action="store_true", help="Show what would change without writing")
     p.add_argument("--no-backup", action="store_true", help="Skip catalog backup")
     p.add_argument("-v", "--verbose", action="store_true")
@@ -219,12 +220,13 @@ def main() -> int:
         datefmt="%H:%M:%S",
     )
 
-    image_path   = Path(args.image)
-    catalog_path = Path(args.catalog)
+    catalog_path  = Path(args.catalog)
+    image_paths   = [Path(p) for p in args.images]
 
-    if not image_path.exists():
-        log.error(f"Image not found: {image_path}")
-        return 1
+    for image_path in image_paths:
+        if not image_path.exists():
+            log.error(f"Image not found: {image_path}")
+            return 1
     if not catalog_path.exists():
         log.error(f"Catalog not found: {catalog_path}")
         return 1
@@ -271,12 +273,11 @@ def main() -> int:
     log.info(f"Taxonomy: {order_disp} / {family}")
 
     if args.dry_run:
-        print(
-            f"\nDRY RUN — would tag {image_path.name!r} as:\n"
-            f"  {display_name} ({sci_name})\n"
-            f"  Order: {order_disp}  Family: {family}\n"
-            "Pass without --dry-run to apply."
-        )
+        print(f"\nDRY RUN — would tag {len(image_paths)} image(s) as {display_name!r} ({sci_name})")
+        print(f"  Order: {order_disp}  Family: {family}")
+        for p in image_paths:
+            print(f"  {p.name}")
+        print("Pass without --dry-run to apply.")
         return 0
 
     # ── Open catalog + log ────────────────────────────────────────────────
@@ -285,7 +286,17 @@ def main() -> int:
     from src.classifier import Prediction
     from src.xmp_writer import clean_xmp_keywords, write_bird_keywords
 
+    manual_pred = Prediction(
+        rank=1,
+        common_name=display_name,
+        sci_name=sci_name,
+        confidence=1.0,
+        is_bird=True,
+        label=label,
+    )
+
     clf_log = ClassificationLog(catalog_path)
+    errors  = 0
 
     with LightroomCatalog.open(
         catalog_path,
@@ -293,68 +304,54 @@ def main() -> int:
         backup=(not args.no_backup),
     ) as cat:
 
-        image_id = _find_image_id(cat, image_path)
-        if image_id is None:
-            log.error(f"Image not found in catalog: {image_path}")
-            clf_log.close()
-            return 1
-
-        log.info(f"Catalog image id_local={image_id}")
-
-        # Collect existing flat tags before wiping (for XMP cleanup)
-        existing_flat = _existing_flat_tags(clf_log, image_id)
-
-        # Wipe existing auto-classification catalog keywords
-        removed = cat.remove_auto_classifications(image_id)
-        if removed:
-            log.info(f"Removed {removed} existing classifier keyword(s)")
-
-        # Bird-Species > {display_name}
-        cat.tag_image(image_id, cat.ensure_bird_species_keyword(display_name))
-
-        # Birds > Order > {order_disp} > {display_name}
+        # Pre-cache keyword IDs that are shared across all images
+        band_kw_id    = cat.ensure_confidence_keyword(confidence_band(1.0))
+        manual_kw_id  = cat.ensure_manually_classed_keyword()
+        top_id        = cat.ensure_bird_species_keyword(display_name)
         ord_id, kw_id = cat.ensure_species_keyword(order_disp or order, display_name)
-        cat.tag_image(image_id, ord_id)
-        cat.tag_image(image_id, kw_id)
+        sci_kw_ids    = (
+            cat.ensure_scientific_keywords(order, family, sci_name)
+            if order and family and sci_name else None
+        )
 
-        # Birds > Scientific > {order} > {family} > {sci_name}
-        if order and family and sci_name:
-            ord_kw_id, fam_kw_id, spc_kw_id = cat.ensure_scientific_keywords(
-                order, family, sci_name
+        for image_path in image_paths:
+            image_id = _find_image_id(cat, image_path)
+            if image_id is None:
+                log.error(f"Not found in catalog: {image_path}")
+                errors += 1
+                continue
+
+            existing_flat = _existing_flat_tags(clf_log, image_id)
+
+            removed = cat.remove_auto_classifications(image_id)
+            if removed:
+                log.debug(f"  {image_path.name}: removed {removed} existing keyword(s)")
+
+            cat.tag_image(image_id, top_id)
+            cat.tag_image(image_id, ord_id)
+            cat.tag_image(image_id, kw_id)
+            if sci_kw_ids:
+                for kid in sci_kw_ids:
+                    cat.tag_image(image_id, kid)
+            cat.tag_image(image_id, band_kw_id)
+            cat.tag_image(image_id, manual_kw_id)
+
+            # XMP + log outside the catalog context is fine, but do them here
+            # so a keyboard interrupt doesn't leave catalog and XMP out of sync.
+            clean_xmp_keywords(image_path, existing_flat)
+            write_bird_keywords(
+                image_path, display_name, order_disp or order, order, family, sci_name
             )
-            cat.tag_image(image_id, ord_kw_id)
-            cat.tag_image(image_id, fam_kw_id)
-            cat.tag_image(image_id, spc_kw_id)
+            clf_log.record(image_id, [manual_pred], model="manual")
 
-        # Classifier-Confidence > Very High  (manual = 1.0)
-        cat.tag_image(image_id, cat.ensure_confidence_keyword(confidence_band(1.0)))
+            log.info(f"Tagged: {image_path.name} → {display_name}")
 
-        # "manually classed" — future auto-runs will skip this image
-        cat.tag_image(image_id, cat.ensure_manually_classed_keyword())
-
-    log.info(f"Catalog written: {image_path.name} → {display_name}")
-
-    # ── XMP sidecar ───────────────────────────────────────────────────────
-    clean_xmp_keywords(image_path, existing_flat)
-    write_bird_keywords(image_path, display_name, order_disp or order, order, family, sci_name)
-
-    # ── Classification log ────────────────────────────────────────────────
-    clf_log.record(
-        image_id,
-        [Prediction(
-            rank=1,
-            common_name=display_name,
-            sci_name=sci_name,
-            confidence=1.0,
-            is_bird=True,
-            label=label,
-        )],
-        model="manual",
-    )
     clf_log.close()
 
-    log.info(f"Done. {image_path.name} tagged as {display_name!r} ({sci_name})")
-    return 0
+    total = len(image_paths)
+    ok    = total - errors
+    log.info(f"Done. {ok}/{total} image(s) tagged as {display_name!r}")
+    return 0 if errors == 0 else 1
 
 
 if __name__ == "__main__":
