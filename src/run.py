@@ -4,26 +4,26 @@ and write species keywords back into the catalog.
 
 Usage::
 
-    python -m src.run /path/to/catalog.lrcat [options]
+    python -m src.run --catalog /path/to/catalog.lrcat [options]
 
     # Dry run (no writes) on RAW+DNG files:
-    python -m src.run catalog.lrcat --dry-run
+    python -m src.run --catalog catalog.lrcat --dry-run
 
     # Classify everything, min 50% confidence:
-    python -m src.run catalog.lrcat --min-confidence 0.5
+    python -m src.run --min-confidence 0.5
 
     # Limit to a specific folder substring:
-    python -m src.run catalog.lrcat --folder "VeroBeach"
+    python -m src.run --folder "VeroBeach"
 
     # Force a region hint (country code or region name):
-    python -m src.run catalog.lrcat --region US
-    python -m src.run catalog.lrcat --region europe
+    python -m src.run --region US
+    python -m src.run --region europe
 
     # Skip geo filtering entirely:
-    python -m src.run catalog.lrcat --no-geo-filter
+    python -m src.run --no-geo-filter
 
     # Re-classify images that already have species tags:
-    python -m src.run catalog.lrcat --no-skip-tagged
+    python -m src.run --no-skip-tagged
 """
 
 from __future__ import annotations
@@ -37,13 +37,23 @@ log = logging.getLogger(__name__)
 
 
 def parse_args() -> argparse.Namespace:
+    from .config import load as _load_config
+    cfg = _load_config()
+
     p = argparse.ArgumentParser(
         description="Classify birds in a Lightroom catalog and write species keywords."
     )
-    p.add_argument("catalog", help="Path to the .lrcat file")
+    p.add_argument(
+        "-c", "--catalog",
+        default=cfg.get("catalog"),
+        help=(
+            "Path to the .lrcat file. "
+            "May be omitted if 'catalog' is set in ~/.lrbc-config."
+        ),
+    )
     p.add_argument(
         "--formats",
-        default="RAW,DNG",
+        default=cfg.get("formats", "RAW,DNG"),
         help=(
             "Comma-separated file formats to classify (default: RAW,DNG). "
             "Add PSD to include Photoshop documents — previews are extracted "
@@ -64,12 +74,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--min-confidence",
         type=float,
-        default=0.25,
+        default=cfg.get("min_confidence", 0.25),
         help="Minimum confidence (0-1) to apply a keyword (default: 0.25)",
     )
     p.add_argument(
         "--model",
-        default=None,
+        default=cfg.get("model"),
         metavar="NETWORK/TAG",
         help=(
             "Model to use for classification, in 'network/tag' format "
@@ -117,7 +127,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--region",
-        default=None,
+        default=cfg.get("region"),
         metavar="REGION",
         help=(
             "Region or country-code hint used when photos have no GPS EXIF data. "
@@ -195,6 +205,10 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    if not args.catalog:
+        log.error("No catalog specified. Pass it as an argument or set 'catalog' in ~/.lrbc-config.")
+        return 1
 
     from src.catalog import LightroomCatalog, confidence_band
     from src.classification_log import ClassificationLog

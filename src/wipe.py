@@ -42,6 +42,9 @@ log = logging.getLogger(__name__)
 
 
 def parse_args() -> argparse.Namespace:
+    from .config import load as _load_config
+    cfg = _load_config()
+
     p = argparse.ArgumentParser(
         description=(
             "Remove auto-classification keywords written by lr-bird-classifier. "
@@ -49,7 +52,14 @@ def parse_args() -> argparse.Namespace:
             "Filters (--folder, --species, --below-confidence) can be combined."
         )
     )
-    p.add_argument("catalog", help="Path to the .lrcat file")
+    p.add_argument(
+        "-c", "--catalog",
+        default=cfg.get("catalog"),
+        help=(
+            "Path to the .lrcat file. "
+            "May be omitted if 'catalog' is set in ~/.lrbc-config."
+        ),
+    )
     p.add_argument(
         "--folder",
         default=None,
@@ -113,6 +123,10 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    if not args.catalog:
+        log.error("No catalog specified. Pass it as an argument or set 'catalog' in ~/.lrbc-config.")
+        return 1
 
     from src.catalog import LightroomCatalog
     from src.classification_log import ClassificationLog

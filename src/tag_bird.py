@@ -6,12 +6,15 @@ given image with the full hierarchy for the specified bird.  No model inference
 is run — this is purely a manual correction tool.
 
 Usage:
-    python src/tag_bird.py "Bald Eagle" /path/to/catalog.lrcat /path/to/image.arw
-    python src/tag_bird.py "Bald Eagle" /path/to/catalog.lrcat img1.arw img2.arw img3.arw
-    python src/tag_bird.py "Bald Eagle" /path/to/catalog.lrcat *.arw --dry-run
+    python src/tag_bird.py --species "Bald Eagle" --images /path/to/image.arw
+    python src/tag_bird.py -s "Bald Eagle" -i img1.arw img2.arw img3.arw
+    python src/tag_bird.py -s "Bald Eagle" -i *.arw --dry-run
+    python src/tag_bird.py -s "Bald Eagle" -i img.arw --catalog /path/to/catalog.lrcat
+
+If 'catalog' is set in ~/.lrbc-config the --catalog flag may be omitted.
 
 Partial / substring matching is supported:
-    python src/tag_bird.py thrasher /path/to/catalog.lrcat img.arw
+    python src/tag_bird.py -s thrasher -i img.arw
     → lists all thrasher species; exits without writing
 
 After writing, the image is marked "manually classed" so future auto-runs skip it.
@@ -197,15 +200,25 @@ def _existing_flat_tags(clf_log, image_id: int) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
+    from src.config import load as _load_config
+    cfg = _load_config()
+
     p = argparse.ArgumentParser(
         description=(
             "Manually tag one or more Lightroom photos with a bird species by common name. "
             "Replaces all existing classifier keywords in the catalog and XMP sidecars."
         )
     )
-    p.add_argument("common_name", help="Bird common name, e.g. 'Bald Eagle'")
-    p.add_argument("catalog",     help="Path to the .lrcat catalog file")
-    p.add_argument("images",      nargs="+", help="One or more image file paths")
+    p.add_argument("-s", "--species", dest="common_name", help="Bird common name, e.g. 'Bald Eagle'")
+    p.add_argument("-i", "--images",  nargs="+",          help="One or more image file paths")
+    p.add_argument(
+        "-c", "--catalog",
+        default=cfg.get("catalog"),
+        help=(
+            "Path to the .lrcat catalog file. "
+            "May be omitted if 'catalog' is set in ~/.lrbc-config."
+        ),
+    )
     p.add_argument("--dry-run",   action="store_true", help="Show what would change without writing")
     p.add_argument("--no-backup", action="store_true", help="Skip catalog backup")
     p.add_argument("-v", "--verbose", action="store_true")
@@ -219,6 +232,16 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    if not args.catalog:
+        log.error("No catalog specified. Use --catalog or set 'catalog' in ~/.lrbc-config.")
+        return 1
+    if not args.common_name:
+        log.error("No species specified. Use --species / -s.")
+        return 1
+    if not args.images:
+        log.error("No images specified. Use --images / -i.")
+        return 1
 
     catalog_path  = Path(args.catalog)
     image_paths   = [Path(p) for p in args.images]
