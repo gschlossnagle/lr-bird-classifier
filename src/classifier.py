@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Optional
 
 import torch
+from PIL import Image
 from torchvision import transforms
 
 from birder.common import fs_ops
@@ -129,8 +130,13 @@ class Classifier:
         Returns:
             List of Prediction objects, sorted by confidence descending.
         """
-        k = top_k or self.top_k
         img = load_image(image_path)
+        return self.predict_image(img, top_k=top_k)
+
+    def predict_image(self, image: Image.Image, top_k: Optional[int] = None) -> list[Prediction]:
+        """Classify a PIL image and return ranked predictions."""
+        k = top_k or self.top_k
+        img = image.convert("RGB")
         tensor = self._transform(img).unsqueeze(0).to(self.device)
 
         with torch.no_grad():

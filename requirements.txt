@@ -2,6 +2,7 @@
 birder @ git+https://github.com/gschlossnagle/birder.git
 torch>=2.10.0
 torchvision
+ultralytics
 
 # RAW image support
 rawpy

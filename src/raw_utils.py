@@ -43,6 +43,14 @@ def _load_psd(path: Path) -> Image.Image:
 
 
 def _load_raw(path: Path) -> Image.Image:
+    from .preview import jpeg_preview   # local import keeps startup fast
+
+    try:
+        with jpeg_preview(path) as tmp:
+            return Image.open(tmp).convert("RGB")
+    except Exception:
+        pass
+
     try:
         import rawpy
         import numpy as np

@@ -1,10 +1,10 @@
 """
-Extract embedded JPEG previews from PSD/PSB (Photoshop) files via exiftool.
+Extract embedded JPEG previews from supported image containers via exiftool.
 
-Photoshop documents store a full-resolution JPEG composite in their Image
-Resources block.  exiftool can pull it out without decoding the full PSD
-layer stack, which makes preview extraction fast and dependency-free beyond
-the already-required exiftool binary.
+This module is used both for Photoshop documents and for RAW files where an
+embedded JPEG preview is often good enough for review and detection. That is
+substantially faster than full RAW decoding and aligns with the review
+workflow's throughput goals.
 
 Usage (context-manager form — temp file is always cleaned up)::
 
@@ -36,33 +36,51 @@ log = logging.getLogger(__name__)
 
 # Extensions this module handles
 PSD_EXTENSIONS = {".psd", ".psb"}
+RAW_EXTENSIONS = {".arw", ".cr2", ".cr3", ".nef", ".orf", ".raf", ".rw2", ".dng", ".pef", ".srw"}
 
 # exiftool tags tried in order of preference (quality / availability)
-_PREVIEW_TAGS = [
+_PHOTOSHOP_PREVIEW_TAGS = [
     "-PreviewImage",    # Full-resolution JPEG composite (Photoshop 5+)
     "-JpgFromRaw",      # Sometimes present in PSB files
     "-ThumbnailImage",  # Smaller — last resort
 ]
 
+_RAW_PREVIEW_TAGS = [
+    "-JpgFromRaw",
+    "-PreviewImage",
+    "-OtherImage",
+    "-ThumbnailImage",
+]
+
 
 def extract_jpeg_preview(path: Path) -> Optional[Path]:
     """
-    Extract a JPEG preview from a PSD or PSB file using exiftool.
+    Extract a JPEG preview from a supported image container using exiftool.
 
-    Tries -PreviewImage, -JpgFromRaw, then -ThumbnailImage in order and
-    returns the first one that yields non-empty output as a temporary file.
+    The exact tags tried depend on file type. Returns the first non-empty
+    extracted preview as a temporary file.
 
     The caller is responsible for deleting the returned file when done.
     Returns None if no preview could be extracted or exiftool is absent.
     """
-    for tag in _PREVIEW_TAGS:
+    tags = _preview_tags_for_path(path)
+    for tag in tags:
         tmp = _try_extract(path, tag)
         if tmp is not None:
             log.debug(f"Extracted preview from {path.name} via {tag} → {tmp.name}")
             return tmp
 
-    log.warning(f"No JPEG preview found in {path.name} — tried {_PREVIEW_TAGS}")
+    log.warning(f"No JPEG preview found in {path.name} — tried {tags}")
     return None
+
+
+def _preview_tags_for_path(path: Path) -> list[str]:
+    suffix = path.suffix.lower()
+    if suffix in PSD_EXTENSIONS:
+        return _PHOTOSHOP_PREVIEW_TAGS
+    if suffix in RAW_EXTENSIONS:
+        return _RAW_PREVIEW_TAGS
+    return _PHOTOSHOP_PREVIEW_TAGS
 
 
 def _try_extract(path: Path, tag: str) -> Optional[Path]:

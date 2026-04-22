@@ -8,6 +8,8 @@ models/
 *.pt
 *.onnx
 results/
+tmp/
+.ultralytics/
 
 # Private Claude instructions and notes (local only, never push)
 CLAUDE.md
