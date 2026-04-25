@@ -12,7 +12,7 @@ from typing import Any
 
 from .review_validation import validate_annotation_row, validate_candidate_row
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class ReviewStore:
@@ -31,6 +31,10 @@ class ReviewStore:
             current_version = self._conn.execute("PRAGMA user_version").fetchone()[0]
             if current_version == 0:
                 self._create_schema()
+                self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+                self._conn.commit()
+            elif current_version < SCHEMA_VERSION:
+                self._migrate_schema(current_version)
                 self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 self._conn.commit()
             elif current_version != SCHEMA_VERSION:
@@ -128,6 +132,12 @@ class ReviewStore:
                 notes        TEXT
             );
 
+            CREATE TABLE extraction_cursors (
+                scope_key      TEXT PRIMARY KEY,
+                cursor_value   TEXT,
+                updated_at     TEXT NOT NULL
+            );
+
             CREATE INDEX idx_images_capture_datetime ON images (capture_datetime);
             CREATE INDEX idx_images_burst_group_id   ON images (burst_group_id);
             CREATE INDEX idx_images_region_hint      ON images (region_hint);
@@ -145,6 +155,25 @@ class ReviewStore:
             CREATE INDEX idx_label_history_label   ON label_history (truth_label);
             """
         )
+
+    def _migrate_schema(self, current_version: int) -> None:
+        if current_version == 1:
+            self._conn.executescript(
+                """
+                CREATE TABLE extraction_cursors (
+                    scope_key      TEXT PRIMARY KEY,
+                    cursor_value   TEXT,
+                    updated_at     TEXT NOT NULL
+                );
+                """
+            )
+            current_version = 2
+
+        if current_version != SCHEMA_VERSION:
+            raise RuntimeError(
+                f"Unsupported review store schema version {current_version}; "
+                f"expected {SCHEMA_VERSION}"
+            )
 
     def close(self) -> None:
         with self._lock:
@@ -199,9 +228,16 @@ class ReviewStore:
             self._conn.commit()
             return int(cur.lastrowid)
 
-    def insert_candidate(self, row: dict[str, Any]) -> None:
+    def insert_candidate(self, row: dict[str, Any]) -> bool:
         validate_candidate_row(row, require_existing_preview=True)
         with self._lock:
+            existing = self._conn.execute(
+                "SELECT id FROM candidates WHERE id = ?",
+                (row["candidate_id"],),
+            ).fetchone()
+            if existing is not None:
+                return False
+
             self._conn.execute(
                 """
                 INSERT INTO candidates (
@@ -230,6 +266,7 @@ class ReviewStore:
                 ),
             )
             self._conn.commit()
+            return True
 
     def mark_candidate_in_review(self, candidate_id: str) -> None:
         self._set_review_status(candidate_id, "in_review")
@@ -244,6 +281,91 @@ class ReviewStore:
                 (status, candidate_id),
             )
             self._conn.commit()
+
+    def reset_review_state(self) -> None:
+        """Clear human review state while preserving extracted candidates and images."""
+        with self._lock:
+            self._conn.execute("DELETE FROM annotations")
+            self._conn.execute("DELETE FROM label_history")
+            self._conn.execute(
+                "UPDATE candidates SET review_status = 'unreviewed', reviewed_at = NULL"
+            )
+            self._conn.commit()
+
+    def get_extraction_cursor(self, scope_key: str) -> str | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT cursor_value FROM extraction_cursors WHERE scope_key = ?",
+                (scope_key,),
+            ).fetchone()
+            return str(row["cursor_value"]) if row and row["cursor_value"] is not None else None
+
+    def set_extraction_cursor(self, scope_key: str, cursor_value: str, updated_at: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO extraction_cursors (scope_key, cursor_value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(scope_key) DO UPDATE SET
+                    cursor_value = excluded.cursor_value,
+                    updated_at = excluded.updated_at
+                """,
+                (scope_key, cursor_value, updated_at),
+            )
+            self._conn.commit()
+
+    def clear_extraction_cursor(self, scope_key: str) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM extraction_cursors WHERE scope_key = ?", (scope_key,))
+            self._conn.commit()
+
+    def delete_images_by_source_paths(self, source_paths: list[str]) -> int:
+        """
+        Delete extracted review rows for the given source image paths.
+
+        This removes annotations and candidates before removing the image rows.
+        Returns the number of image rows deleted.
+        """
+        if not source_paths:
+            return 0
+        deleted = 0
+        with self._lock:
+            for i in range(0, len(source_paths), 500):
+                chunk = source_paths[i : i + 500]
+                placeholders = ",".join("?" * len(chunk))
+                image_rows = self._conn.execute(
+                    f"SELECT id FROM images WHERE source_image_path IN ({placeholders})",
+                    chunk,
+                ).fetchall()
+                image_ids = [int(row["id"]) for row in image_rows]
+                if not image_ids:
+                    continue
+
+                id_placeholders = ",".join("?" * len(image_ids))
+                candidate_rows = self._conn.execute(
+                    f"SELECT id FROM candidates WHERE image_id IN ({id_placeholders})",
+                    image_ids,
+                ).fetchall()
+                candidate_ids = [str(row["id"]) for row in candidate_rows]
+                if candidate_ids:
+                    candidate_placeholders = ",".join("?" * len(candidate_ids))
+                    self._conn.execute(
+                        f"DELETE FROM annotations WHERE candidate_id IN ({candidate_placeholders})",
+                        candidate_ids,
+                    )
+                    self._conn.execute(
+                        f"DELETE FROM candidates WHERE id IN ({candidate_placeholders})",
+                        candidate_ids,
+                    )
+
+                self._conn.execute(
+                    f"DELETE FROM images WHERE id IN ({id_placeholders})",
+                    image_ids,
+                )
+                deleted += len(image_ids)
+
+            self._conn.commit()
+        return deleted
 
     def upsert_annotation(self, row: dict[str, Any]) -> None:
         validate_annotation_row(row)
@@ -358,13 +480,76 @@ class ReviewStore:
         if burst_group_id is not None:
             sql += " AND i.burst_group_id = ?"
             params.append(burst_group_id)
-        sql += " ORDER BY i.capture_datetime ASC, c.id ASC"
+        sql += " ORDER BY julianday(i.capture_datetime) ASC, i.capture_datetime ASC, c.id ASC"
         if limit is not None:
             sql += " LIMIT ?"
             params.append(limit)
         with self._lock:
             rows = self._conn.execute(sql, params).fetchall()
             return [dict(row) for row in rows]
+
+    def count_candidates(
+        self,
+        *,
+        review_status: str | None = None,
+        burst_group_id: str | None = None,
+    ) -> int:
+        sql = """
+            SELECT COUNT(*) AS n
+            FROM candidates c
+            JOIN images i ON i.id = c.image_id
+            WHERE 1 = 1
+        """
+        params: list[Any] = []
+        if review_status is not None:
+            sql += " AND c.review_status = ?"
+            params.append(review_status)
+        if burst_group_id is not None:
+            sql += " AND i.burst_group_id = ?"
+            params.append(burst_group_id)
+        with self._lock:
+            row = self._conn.execute(sql, params).fetchone()
+            return int(row["n"]) if row else 0
+
+    def count_candidate_images(
+        self,
+        *,
+        review_status: str | None = None,
+    ) -> int:
+        sql = """
+            SELECT COUNT(DISTINCT c.image_id) AS n
+            FROM candidates c
+            WHERE 1 = 1
+        """
+        params: list[Any] = []
+        if review_status is not None:
+            sql += " AND c.review_status = ?"
+            params.append(review_status)
+        with self._lock:
+            row = self._conn.execute(sql, params).fetchone()
+            return int(row["n"]) if row else 0
+
+    def queue_position(
+        self,
+        candidate_id: str,
+        *,
+        review_status: str = "unreviewed",
+    ) -> tuple[int, int] | None:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT c.id
+                FROM candidates c
+                JOIN images i ON i.id = c.image_id
+                WHERE c.review_status = ?
+                ORDER BY julianday(i.capture_datetime) ASC, i.capture_datetime ASC, c.id ASC
+                """,
+                (review_status,),
+            ).fetchall()
+            ordered_ids = [row["id"] for row in rows]
+            if candidate_id not in ordered_ids:
+                return None
+            return ordered_ids.index(candidate_id) + 1, len(ordered_ids)
 
     def get_annotation(self, candidate_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -388,7 +573,7 @@ class ReviewStore:
                 ORDER BY used_at DESC, id DESC
                 LIMIT ?
                 """,
-                (max(limit * 5, limit),),
+                (max(limit * 50, 250),),
             ).fetchall()
             unique: list[dict[str, Any]] = []
             seen: set[str] = set()
@@ -421,8 +606,14 @@ class ReviewStore:
                 FROM candidates c
                 JOIN images i ON i.id = c.image_id
                 WHERE c.review_status = 'reviewed'
-                  AND (i.capture_datetime < ? OR (i.capture_datetime = ? AND c.id < ?))
-                ORDER BY i.capture_datetime DESC, c.id DESC
+                  AND (
+                    julianday(i.capture_datetime) < julianday(?)
+                    OR (
+                      julianday(i.capture_datetime) = julianday(?)
+                      AND c.id < ?
+                    )
+                  )
+                ORDER BY julianday(i.capture_datetime) DESC, i.capture_datetime DESC, c.id DESC
                 LIMIT 1
                 """,
                 (current["capture_datetime"], current["capture_datetime"], current["id"]),
@@ -459,9 +650,38 @@ class ReviewStore:
             params: list[Any] = [current["burst_group_id"], candidate_id]
             if not include_reviewed:
                 sql += " AND c.review_status != 'reviewed'"
-            sql += " ORDER BY i.capture_datetime ASC, c.id ASC"
+            sql += " ORDER BY julianday(i.capture_datetime) ASC, i.capture_datetime ASC, c.id ASC"
             rows = self._conn.execute(sql, params).fetchall()
             return [dict(row) for row in rows]
+
+    def burst_position(self, candidate_id: str) -> tuple[int, int] | None:
+        with self._lock:
+            current = self._conn.execute(
+                """
+                SELECT i.burst_group_id AS burst_group_id, i.capture_datetime AS capture_datetime, c.id AS id
+                FROM candidates c
+                JOIN images i ON i.id = c.image_id
+                WHERE c.id = ?
+                """,
+                (candidate_id,),
+            ).fetchone()
+            if current is None or not current["burst_group_id"]:
+                return None
+
+            rows = self._conn.execute(
+                """
+                SELECT c.id
+                FROM candidates c
+                JOIN images i ON i.id = c.image_id
+                WHERE i.burst_group_id = ?
+                ORDER BY julianday(i.capture_datetime) ASC, i.capture_datetime ASC, c.id ASC
+                """,
+                (current["burst_group_id"],),
+            ).fetchall()
+            ordered_ids = [row["id"] for row in rows]
+            if candidate_id not in ordered_ids:
+                return None
+            return ordered_ids.index(candidate_id) + 1, len(ordered_ids)
 
     def apply_annotation_to_burst(
         self,
@@ -476,3 +696,45 @@ class ReviewStore:
             self.upsert_annotation(row)
             count += 1
         return count
+
+    def summary_counts(self) -> dict[str, Any]:
+        with self._lock:
+            overview_rows = self._conn.execute(
+                """
+                SELECT review_status, COUNT(*) AS n
+                FROM candidates
+                GROUP BY review_status
+                """
+            ).fetchall()
+            overview = {row["review_status"]: int(row["n"]) for row in overview_rows}
+
+            outcome_rows = self._conn.execute(
+                """
+                SELECT annotation_status, COUNT(*) AS n
+                FROM annotations
+                GROUP BY annotation_status
+                """
+            ).fetchall()
+            outcomes = {row["annotation_status"]: int(row["n"]) for row in outcome_rows}
+
+            species_rows = self._conn.execute(
+                """
+                SELECT
+                    truth_common_name,
+                    truth_sci_name,
+                    truth_label,
+                    SUM(CASE WHEN stress = 0 THEN 1 ELSE 0 END) AS normal_count,
+                    SUM(CASE WHEN stress = 1 THEN 1 ELSE 0 END) AS stress_count,
+                    COUNT(*) AS total_count
+                FROM annotations
+                WHERE annotation_status = 'labeled'
+                GROUP BY truth_label, truth_common_name, truth_sci_name
+                ORDER BY total_count DESC, truth_common_name ASC
+                """
+            ).fetchall()
+            species = [dict(row) for row in species_rows]
+            return {
+                "overview": overview,
+                "outcomes": outcomes,
+                "species": species,
+            }

@@ -149,6 +149,7 @@ class LightroomCatalog:
         formats: Optional[set[str]] = None,
         folder_filter: Optional[str] = None,
         min_rating: Optional[int] = None,
+        start_after_id: Optional[int] = None,
         limit: Optional[int] = None,
     ) -> list[CatalogImage]:
         """
@@ -160,6 +161,7 @@ class LightroomCatalog:
             folder_filter: only include images whose path contains this substring.
             min_rating: only include images with a star rating >= this value (1–5).
                         Unrated images (NULL or 0) are always excluded when set.
+            start_after_id: only include images with id_local greater than this value.
             limit: max number of images to return.
         """
         sql = """
@@ -190,6 +192,10 @@ class LightroomCatalog:
             sql += " AND i.rating >= ?"
             params.append(int(min_rating))
 
+        if start_after_id is not None:
+            sql += " AND i.id_local > ?"
+            params.append(int(start_after_id))
+
         if folder_filter:
             sql += " AND (rf.absolutePath || fo.pathFromRoot) LIKE ?"
             if folder_filter.startswith("/"):
@@ -202,6 +208,8 @@ class LightroomCatalog:
             else:
                 # Substring match for short names like "Birds" or "2024/Hawks"
                 params.append(f"%{folder_filter}%")
+
+        sql += " ORDER BY i.id_local ASC"
 
         if limit:
             sql += f" LIMIT {int(limit)}"
@@ -223,6 +231,55 @@ class LightroomCatalog:
             ))
 
         return images
+
+    def count_images(
+        self,
+        *,
+        formats: Optional[set[str]] = None,
+        folder_filter: Optional[str] = None,
+        min_rating: Optional[int] = None,
+        start_after_id: Optional[int] = None,
+        limit: Optional[int] = None,
+    ) -> int:
+        """
+        Return the number of images matching the same filters accepted by
+        `get_images()`.
+        """
+        sql = """
+            SELECT COUNT(*)
+            FROM Adobe_images i
+            JOIN AgLibraryFile fi ON fi.id_local = i.rootFile
+            JOIN AgLibraryFolder fo ON fo.id_local = fi.folder
+            JOIN AgLibraryRootFolder rf ON rf.id_local = fo.rootFolder
+            WHERE i.masterImage IS NULL
+        """
+        params: list = []
+
+        if formats:
+            placeholders = ",".join("?" * len(formats))
+            sql += f" AND i.fileFormat IN ({placeholders})"
+            params.extend(formats)
+
+        if min_rating is not None:
+            sql += " AND i.rating >= ?"
+            params.append(int(min_rating))
+
+        if start_after_id is not None:
+            sql += " AND i.id_local > ?"
+            params.append(int(start_after_id))
+
+        if folder_filter:
+            sql += " AND (rf.absolutePath || fo.pathFromRoot) LIKE ?"
+            if folder_filter.startswith("/"):
+                prefix = folder_filter.rstrip("/") + "/"
+                params.append(f"{prefix}%")
+            else:
+                params.append(f"%{folder_filter}%")
+
+        count = int(self._conn.execute(sql, params).fetchone()[0])
+        if limit is not None:
+            return min(count, int(limit))
+        return count
 
     def get_image_paths(self, image_ids: set[int]) -> dict[int, Path]:
         """
