@@ -94,6 +94,9 @@ Rules:
   mechanics with minimal UI branching
 - must support workflow-specific action sets so the regular-user review-run
   experience is simpler than the expert annotation workflow
+- must support workflow-specific rendering, copy, and summary semantics because
+  the current candidate view already embeds expert-only concepts directly in the
+  layout
 
 ### `src.apply_review_labels`
 
@@ -313,6 +316,50 @@ Reason:
   about dataset curation
 - exposing expert-only negative outcomes would add friction and confuse the
   workflow
+
+### Workflow-Specific Presentation Rules
+
+The current review UI now embeds expert semantics directly into the candidate
+layout, shortcut help, and summary tables. The implementation plan must treat
+workflow-specific presentation as a first-class requirement, not an incidental
+detail.
+
+#### `detector_review`
+
+The expert workflow keeps:
+
+- stress toggle
+- burst-apply defaults and burst-specific help text
+- expert-only outcome buttons
+- shortcut copy that references expert actions
+- expert summary tables including stress and negative-outcome counts
+- detector-oriented metadata language
+
+#### `run_hybrid_review`
+
+The regular-user workflow must simplify or remove that expert framing.
+
+Required UI differences:
+
+- no stress toggle
+- no reject / unsure / not-a-bird / bad-crop / duplicate controls
+- no expert shortcut copy
+- no burst-apply default wording unless deliberately added later for this
+  workflow
+- no "Other outcomes" panel beyond skip
+- no stress-oriented summary columns
+- no expert negative-outcome rows in the normal summary view
+- review copy should read like a tagging/correction tool, not a dataset
+  annotation workstation
+
+Preferred content model:
+
+- classifier suggestion
+- manual label entry
+- recent labels
+- save label
+- skip
+- compact queue and source metadata
 
 ### Workflow-Specific Annotation Semantics
 
@@ -554,6 +601,8 @@ Responsibilities:
 - writing seeded suggestion rows
 - ensuring deferred review items are created as `run_hybrid_review` scopes with
   simplified action semantics
+- providing enough scope metadata for `review_app` to render the correct
+  workflow-specific view
 
 ### `src/review_apply_state.py`
 
@@ -667,15 +716,64 @@ Changes:
 
 - if a seeded suggestion exists for the candidate, use it first
 - otherwise fall back to the existing live suggestion behavior
+- split the current monolithic candidate render path into:
+  - shared candidate-shell/layout pieces
+  - workflow-specific action/render fragments
 - branch the candidate action surface by `workflow_type`
 - keep shared navigation, queueing, preview, recent-label, and suggestion
   mechanics intact
 - render a simplified regular-user labeling panel for `run_hybrid_review`
+- replace workflow-inappropriate copy in `run_hybrid_review`, including:
+  - burst-apply language
+  - expert shortcut help
+  - stress-related wording
+  - expert-only summary terminology
 
 Outcome:
 
 - suggestion behavior stays aligned with `review_run`
 - regular-user review avoids expert-only outcomes and stress semantics
+- the current richer UI layout is preserved, but its expert-only semantics are
+  isolated behind workflow-specific fragments instead of being hardcoded into
+  one render block
+
+### 5a. Add Workflow-Specific POST Validation In `review_app`
+
+Update:
+
+- `src/review_app.py`
+
+Changes:
+
+- resolve the active scope before accepting actions
+- enforce allowed actions by `workflow_type` on the server side
+- reject expert-only actions for `run_hybrid_review` even if a crafted POST is
+  submitted
+- ensure `skip` remains candidate-state-only for `run_hybrid_review`
+
+Outcome:
+
+- workflow restrictions are enforced by the application contract, not merely by
+  button visibility
+
+### 5b. Add Workflow-Specific Summary Rendering
+
+Update:
+
+- `src/review_app.py`
+- possibly `src/review_store.py` summary helpers if cleaner separation is needed
+
+Changes:
+
+- keep the current expert summary for `detector_review`
+- add a simplified summary for `run_hybrid_review`
+- remove stress columns and expert negative-outcome rows from the regular-user
+  summary path
+
+Outcome:
+
+- summary pages reflect the product semantics of each workflow instead of
+  reusing expert annotation terminology everywhere
 
 ### 6. Add Apply Ledger Persistence
 
@@ -810,6 +908,9 @@ UI changes for `run_hybrid_review`:
 - remove reject, unsure, not-a-bird, bad-crop, and duplicate controls
 - replace the "Other Outcomes" section with a single skip action, or remove the
   section entirely and place skip alongside the primary save action
+- replace the current expert shortcut/help copy with workflow-specific help
+- suppress burst-apply default copy unless the workflow explicitly supports it
+- suppress expert summary fields such as stress breakdown
 
 Reason:
 
@@ -864,6 +965,7 @@ Add coverage for:
 - seeded suggestion upsert/read
 - hybrid-review idempotent candidate creation
 - workflow-specific action validation for `run_hybrid_review`
+- workflow-specific summary rendering for `run_hybrid_review`
 - image-level consolidation rules
 - conflict handling
 
@@ -878,6 +980,7 @@ Add coverage for:
 - unrelated user keywords survive managed-state replacement
 - `run_hybrid_review` scopes expose only label-and-skip behavior in the review
   UI
+- crafted expert-only POST actions are rejected for `run_hybrid_review`
 
 ### Manual Tests
 
@@ -897,12 +1000,15 @@ Recommended build order:
 3. refactor `src/tag_bird.py`
 4. extend `src/review_store.py`
 5. add `src/review_run_seed.py`
-6. update `src/review_app.py` for seeded suggestions
-7. add `src/review_apply_state.py`
-8. add `src/review_apply.py`
-9. add `src/apply_review_labels.py`
-10. add `src/review_run.py`
-11. update docs and test coverage
+6. refactor `src/review_app.py` into shared layout plus workflow-specific
+   render/action helpers
+7. update `src/review_app.py` for seeded suggestions, workflow-specific POST
+   validation, and workflow-specific summaries
+8. add `src/review_apply_state.py`
+9. add `src/review_apply.py`
+10. add `src/apply_review_labels.py`
+11. add `src/review_run.py`
+12. update docs and test coverage
 
 Reason:
 
@@ -927,6 +1033,7 @@ That is enough to deliver:
 - no double-classification burden
 - explicit expert apply support
 - full idempotent writeback semantics
+- workflow-specific UI semantics that match the intended audience of each tool
 
 ## Acceptance Criteria
 
