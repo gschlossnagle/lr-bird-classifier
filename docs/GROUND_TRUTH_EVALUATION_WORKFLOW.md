@@ -52,6 +52,16 @@ box size` readout. This is a rough real-world size estimate derived from focus
 distance, 35mm-equivalent focal length, and the detector box geometry. It is a
 useful cue, not ground truth.
 
+The review UI may also show an external eBird / Macaulay reference panel for
+the current species suggestion or selected label. This is a reviewer aid only:
+
+- it is resolved from the official eBird taxonomy species code
+- it links to the eBird species page and a Macaulay reference asset
+- it may show a remote reference image in the UI
+- it requires internet access at review time
+- the media is not stored locally as part of the review database
+- the media is not exported with benchmark datasets
+
 ## Core Idea
 
 The workflow deliberately separates four things:

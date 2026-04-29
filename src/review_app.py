@@ -21,6 +21,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .catalog_extract import CatalogExtractor
+from .ebird_reference import resolve_reference
 from .extract_candidates import _build_detector, _load_object, _scope_key
 from .label_resolver import AmbiguousLabelError, LabelResolver, ResolvedLabel, UnknownLabelError
 from .review_queue import QueueFilters, ReviewQueue
@@ -747,6 +748,32 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
               <div class="small">{html.escape(stress_reason)}</div>
             </div>
             """
+        ebird_reference = self._build_ebird_reference(
+            annotation=annotation,
+            suggestion=suggestion,
+            selected_truth_label=prefill_selected_truth_label,
+        )
+        ebird_reference_html = ""
+        if ebird_reference is not None:
+            reference_image_html = ""
+            if ebird_reference.preview_image_url:
+                reference_image_html = (
+                    f'<div style="margin-top:10px">'
+                    f'<img src="{html.escape(ebird_reference.preview_image_url)}" '
+                    f'alt="{html.escape(ebird_reference.truth_common_name)} Macaulay reference photo" '
+                    f'style="max-height: 260px; width: auto;"></div>'
+                )
+            ebird_reference_html = f"""
+            <div class="resolved">
+              <div><strong>eBird reference</strong>: {html.escape(ebird_reference.truth_common_name)} ({html.escape(ebird_reference.truth_sci_name)})</div>
+              {reference_image_html or '<div class="small">Reference photo unavailable; external links still available.</div>'}
+              <div class="small" style="margin-top:8px">Remote eBird / Macaulay reference only. This tool does not store or export the media.</div>
+              <div style="margin-top:8px">
+                <a href="{html.escape(ebird_reference.species_url)}" target="_blank" rel="noopener"><button type="button">Open eBird Species Page</button></a>
+                <a href="{html.escape(ebird_reference.macaulay_asset_url or ebird_reference.media_search_url)}" target="_blank" rel="noopener"><button type="button">Open Macaulay Reference</button></a>
+              </div>
+            </div>
+            """
         estimated_size_html = ""
         if estimated_subject_box_size is not None:
             estimated_size_html = (
@@ -788,6 +815,7 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
             {resolved_preview}
             {selected_preview}
             {suggestion_html}
+            {ebird_reference_html}
             {stress_reason_html}
             <div style="margin: 10px 0 16px 0;">
               {f'<a data-nav="prev" href="/review?scope={_q(scope["scope_key"])}&id={html.escape(prev_candidate["id"])}"><button type="button">(P) Previous Reviewed Candidate</button></a>' if prev_candidate else '<button type="button" disabled>(P) Previous Reviewed Candidate</button>'}
@@ -1052,6 +1080,44 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
                     candidate["bbox_x2"],
                     candidate["bbox_y2"],
                 ),
+            )
+        except Exception:
+            return None
+
+    def _build_ebird_reference(
+        self,
+        *,
+        annotation: dict[str, Any] | None,
+        suggestion: SuggestedLabel | None,
+        selected_truth_label: str,
+    ):
+        truth_common_name: str | None = None
+        truth_sci_name: str | None = None
+
+        if selected_truth_label and self.label_resolver is not None:
+            try:
+                resolved = self.label_resolver.resolve_recent_label(selected_truth_label)
+            except UnknownLabelError:
+                resolved = None
+            if resolved is not None:
+                truth_common_name = resolved.truth_common_name
+                truth_sci_name = resolved.truth_sci_name
+
+        if truth_common_name is None and annotation and annotation.get("annotation_status") == "labeled":
+            truth_common_name = annotation.get("truth_common_name")
+            truth_sci_name = annotation.get("truth_sci_name")
+
+        if truth_common_name is None and suggestion is not None:
+            truth_common_name = suggestion.truth_common_name
+            truth_sci_name = suggestion.truth_sci_name
+
+        if not truth_common_name or not truth_sci_name:
+            return None
+
+        try:
+            return resolve_reference(
+                truth_common_name=truth_common_name,
+                truth_sci_name=truth_sci_name,
             )
         except Exception:
             return None
