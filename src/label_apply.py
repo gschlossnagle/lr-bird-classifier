@@ -8,6 +8,8 @@ slightly-different writer paths.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -75,6 +77,37 @@ def flat_keywords_for_label(label: SpeciesLabel) -> list[str]:
     )
 
 
+def managed_keyword_names_for_labels(
+    labels: Iterable[SpeciesLabel],
+    *,
+    confidence_band_name: str | None = None,
+    manual: bool = False,
+) -> set[str]:
+    """Return the managed Lightroom keyword names expected for these labels."""
+    names: set[str] = set()
+    for label in labels:
+        names.add(label.common_name)
+        if label.order_display:
+            names.add(label.order_display)
+        if label.order:
+            names.add(label.order)
+        if label.family:
+            names.add(label.family)
+        if label.sci_name:
+            names.add(label.sci_name)
+    if confidence_band_name:
+        names.add(confidence_band_name)
+    if manual:
+        names.add("manually classed")
+    return names
+
+
+def managed_keyword_fingerprint(names: Iterable[str]) -> str:
+    """Compute a stable fingerprint for a managed keyword-name set."""
+    payload = json.dumps(sorted(set(name for name in names if name)), separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def apply_catalog_species_label(
     cat,
     image_id: int,
@@ -116,6 +149,26 @@ def apply_catalog_species_label(
         cat.tag_image(image_id, manual_id)
 
     return newly_tagged
+
+
+def replace_catalog_species_labels(
+    cat,
+    image_id: int,
+    labels: Iterable[SpeciesLabel],
+    *,
+    confidence_band_name: str | None = None,
+    manual: bool = False,
+) -> None:
+    """Replace managed catalog labels on an image with the provided species set."""
+    cat.remove_auto_classifications(image_id)
+    for idx, label in enumerate(labels):
+        apply_catalog_species_label(
+            cat,
+            image_id,
+            label,
+            confidence_band_name=confidence_band_name if idx == 0 else None,
+            manual=manual if idx == 0 else False,
+        )
 
 
 def write_sidecar_species_labels(

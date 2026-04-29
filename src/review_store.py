@@ -843,6 +843,65 @@ class ReviewStore:
                 result[key] = bool(result[key])
             return result
 
+    def list_reviewed_image_annotations(self, *, scope_key: str | None = None) -> list[dict[str, Any]]:
+        """
+        Return reviewed candidate/image/annotation rows joined for apply/export flows.
+
+        One row is returned per reviewed candidate with image, scope, and
+        annotation fields flattened together for easier downstream grouping.
+        """
+        sql = """
+            SELECT
+                s.scope_key AS scope_key,
+                s.scope_name AS scope_name,
+                s.catalog_name AS catalog_name,
+                s.catalog_path AS catalog_path,
+                s.trip_folder AS trip_folder,
+                s.workflow_type AS workflow_type,
+                i.id AS image_row_id,
+                i.source_image_id AS source_image_id,
+                i.source_image_path AS source_image_path,
+                i.capture_datetime AS capture_datetime,
+                i.folder AS folder,
+                i.burst_group_id AS burst_group_id,
+                c.id AS candidate_id,
+                c.review_status AS review_status,
+                c.reviewed_at AS reviewed_at,
+                a.annotation_status AS annotation_status,
+                a.truth_common_name AS truth_common_name,
+                a.truth_sci_name AS truth_sci_name,
+                a.truth_label AS truth_label,
+                a.taxon_class AS taxon_class,
+                a.resolved_from_input AS resolved_from_input,
+                a.stress AS stress,
+                a.reject_sample AS reject_sample,
+                a.unsure AS unsure,
+                a.not_a_bird AS not_a_bird,
+                a.bad_crop AS bad_crop,
+                a.duplicate_sample AS duplicate_sample,
+                a.notes AS notes,
+                a.annotated_at AS annotated_at
+            FROM annotations a
+            JOIN candidates c ON c.id = a.candidate_id
+            JOIN images i ON i.id = c.image_id
+            JOIN review_scopes s ON s.scope_key = i.scope_key
+            WHERE 1 = 1
+        """
+        params: list[Any] = []
+        if scope_key is not None:
+            sql += " AND s.scope_key = ?"
+            params.append(scope_key)
+        sql += " ORDER BY julianday(i.capture_datetime) ASC, i.capture_datetime ASC, c.id ASC"
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+            result: list[dict[str, Any]] = []
+            for row in rows:
+                item = dict(row)
+                for key in ("stress", "reject_sample", "unsure", "not_a_bird", "bad_crop", "duplicate_sample"):
+                    item[key] = bool(item[key])
+                result.append(item)
+            return result
+
     def recent_labels(self, limit: int = 5) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(
