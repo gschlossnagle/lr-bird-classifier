@@ -5,7 +5,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from src.review_app import QueueTopUpRunner, load_label_inventory, parse_args
+from src.review_app import QueueTopUpRunner, ReviewAppHandler, load_label_inventory, parse_args
+from src.review_suggester import SuggestedLabel
 
 
 class ReviewAppTest(unittest.TestCase):
@@ -74,6 +75,85 @@ class ReviewAppTest(unittest.TestCase):
                 jpeg_quality=85,
             )
         self.assertEqual(runner.extractor.detector.model, "yolov8m.pt")
+
+    def test_run_hybrid_review_allows_only_save_and_skip(self) -> None:
+        scope = {"workflow_type": "run_hybrid_review"}
+        self.assertEqual(ReviewAppHandler._allowed_actions(scope), {"save", "skip"})
+
+    def test_render_candidate_hides_expert_actions_for_run_hybrid_review(self) -> None:
+        handler = object.__new__(ReviewAppHandler)
+        scope = {
+            "scope_key": "scope_hybrid",
+            "scope_name": "Catalog / Hybrid",
+            "catalog_name": "Catalog",
+            "trip_folder": "/photos/Hybrid",
+            "workflow_type": "run_hybrid_review",
+        }
+        candidate = {
+            "id": "runimg_123",
+            "detector_name": "seeded",
+            "detector_confidence": 0.61,
+        }
+        image = {
+            "source_image_path": "/photos/Hybrid/IMG_0001.ARW",
+            "capture_datetime": "2026-04-29T10:00:00Z",
+            "region_hint": "north_america",
+            "burst_group_id": "",
+        }
+        html = handler._render_candidate(
+            scope,
+            candidate,
+            image,
+            annotation=None,
+            recent=[],
+            error="",
+            prev_candidate=None,
+            burst_target_count=2,
+            burst_position=None,
+            queue_position=(1, 4),
+            unreviewed_images=4,
+            unreviewed_candidates=4,
+            suggestion=SuggestedLabel(
+                truth_common_name="Bald Eagle",
+                truth_sci_name="Haliaeetus leucocephalus",
+                truth_label="00419_label",
+                confidence=0.61,
+            ),
+            estimated_subject_box_size=None,
+            suggestion_status=None,
+            prefill_selected_truth_label="",
+            prefill_label_input="",
+            prefill_stress=False,
+            prefill_notes="",
+            stress_reason="",
+        )
+        self.assertIn("Save Label", html)
+        self.assertIn("Skip", html)
+        self.assertNotIn("mark as stress", html)
+        self.assertNotIn("Reject", html)
+        self.assertNotIn("Not a Bird", html)
+        self.assertNotIn("Save + Apply To Burst", html)
+
+    def test_render_summary_simplifies_run_hybrid_review_columns(self) -> None:
+        scope = {"scope_key": "scope_hybrid", "scope_name": "Catalog / Hybrid", "workflow_type": "run_hybrid_review"}
+        summary = {
+            "overview": {"unreviewed": 1, "reviewed": 2, "skipped": 1},
+            "outcomes": {"labeled": 2, "reject": 1},
+            "species": [
+                {
+                    "truth_common_name": "Bald Eagle",
+                    "truth_sci_name": "Haliaeetus leucocephalus",
+                    "normal_count": 1,
+                    "stress_count": 1,
+                    "total_count": 2,
+                }
+            ],
+        }
+        html = ReviewAppHandler._render_summary(scope, summary, "runimg_123", {"running": False})
+        self.assertIn("<th>Total</th>", html)
+        self.assertNotIn("<th>Stress</th>", html)
+        self.assertNotIn("Reject", html)
+        self.assertIn("Bald Eagle", html)
 
 
 if __name__ == "__main__":

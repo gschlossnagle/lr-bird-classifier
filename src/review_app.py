@@ -31,6 +31,8 @@ from .review_store import ReviewStore
 from .subject_size_estimate import estimated_subject_box_size_for_candidate
 
 STRESS_SUGGESTION_CONFIDENCE_THRESHOLD = 0.35
+WORKFLOW_DETECTOR_REVIEW = "detector_review"
+WORKFLOW_RUN_HYBRID_REVIEW = "run_hybrid_review"
 log = logging.getLogger(__name__)
 
 
@@ -431,6 +433,30 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
     topup_coordinator: QueueTopUpCoordinator | None
     topup_low_watermark: int
 
+    @staticmethod
+    def _workflow_type(scope: dict[str, Any] | None) -> str:
+        if scope is None:
+            return WORKFLOW_DETECTOR_REVIEW
+        return str(scope.get("workflow_type") or WORKFLOW_DETECTOR_REVIEW)
+
+    @classmethod
+    def _is_run_hybrid_review(cls, scope: dict[str, Any] | None) -> bool:
+        return cls._workflow_type(scope) == WORKFLOW_RUN_HYBRID_REVIEW
+
+    @classmethod
+    def _allows_stress(cls, scope: dict[str, Any] | None) -> bool:
+        return not cls._is_run_hybrid_review(scope)
+
+    @classmethod
+    def _allows_burst_apply(cls, scope: dict[str, Any] | None) -> bool:
+        return not cls._is_run_hybrid_review(scope)
+
+    @classmethod
+    def _allowed_actions(cls, scope: dict[str, Any] | None) -> set[str]:
+        if cls._is_run_hybrid_review(scope):
+            return {"save", "skip"}
+        return {"save", "save_burst", "skip", "reject", "unsure", "not_a_bird", "bad_crop", "duplicate"}
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path in {"/", "/review"}:
@@ -618,6 +644,11 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
             return
 
         try:
+            if action not in self._allowed_actions(scope):
+                raise ValueError(
+                    f"Action '{action}' is not allowed for workflow "
+                    f"'{self._workflow_type(scope)}'"
+                )
             if action == "skip":
                 self.store.mark_candidate_skipped(candidate_id)
             elif action in {"reject", "unsure", "not_a_bird", "bad_crop", "duplicate"}:
@@ -641,8 +672,10 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
                 image = self.store.get_image(candidate.get("image_id")) or {}
                 suggestion = self._build_suggestion(candidate, image, scope)
                 stress_reason = self._stress_reason(resolved.truth_label, suggestion)
-                if stress_reason and not stress:
+                if self._allows_stress(scope) and stress_reason and not stress:
                     stress = True
+                elif not self._allows_stress(scope):
+                    stress = False
                 row = self._build_labeled_row(candidate_id, resolved, label_input or selected_truth_label, stress, notes)
                 self.store.upsert_annotation(row)
             elif action == "save_burst":
@@ -651,8 +684,10 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
                 image = self.store.get_image(candidate.get("image_id")) or {}
                 suggestion = self._build_suggestion(candidate, image, scope)
                 stress_reason = self._stress_reason(resolved.truth_label, suggestion)
-                if stress_reason and not stress:
+                if self._allows_stress(scope) and stress_reason and not stress:
                     stress = True
+                elif not self._allows_stress(scope):
+                    stress = False
                 row = self._build_labeled_row(candidate_id, resolved, label_input or selected_truth_label, stress, notes)
                 self.store.upsert_annotation(row)
                 self.store.apply_annotation_to_burst(candidate_id, row)
@@ -728,8 +763,11 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
         prefill_notes: str,
         stress_reason: str,
     ) -> str:
-        default_save_action = "save_burst" if burst_target_count else "save"
-        default_save_label = "Save + Apply To Burst" if burst_target_count else "Save Label"
+        is_run_hybrid_review = self._is_run_hybrid_review(scope)
+        allow_stress = self._allows_stress(scope)
+        allow_burst_apply = self._allows_burst_apply(scope)
+        default_save_action = "save_burst" if allow_burst_apply and burst_target_count else "save"
+        default_save_label = "Save + Apply To Burst" if default_save_action == "save_burst" else "Save Label"
         burst_label = ""
         if burst_position is not None:
             burst_label = f" ({burst_position[0]}/{burst_position[1]})"
@@ -756,7 +794,7 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
                 f"<div class='resolved'><strong>Current:</strong> "
                 f"{html.escape(annotation['truth_common_name'])} "
                 f"({html.escape(annotation['truth_sci_name'])})"
-                f"{' [stress]' if annotation['stress'] else ''}</div>"
+                f"{' [stress]' if allow_stress and annotation['stress'] else ''}</div>"
             )
         selected_preview = ""
         if prefill_label_input:
@@ -788,7 +826,7 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
             </div>
             """
         stress_reason_html = ""
-        if stress_reason:
+        if allow_stress and stress_reason:
             stress_reason_html = f"""
             <div class="resolved">
               <div><strong>Stress suggested</strong></div>
@@ -846,8 +884,40 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
             "This candidate has "
             + str(burst_target_count)
             + " other safe burst item(s), so label actions default to burst apply."
-            if burst_target_count
+            if allow_burst_apply and burst_target_count
             else "No safe burst targets available. Burst apply only includes other unreviewed, single-detection candidates in the same burst group."
+            if allow_burst_apply
+            else "This workflow labels one image at a time. Save applies only to the current image."
+        )
+        shortcut_help = (
+            "Type a common name or use a recent label button below. Shortcuts: 0, 1-5, R, T, K, N, P, F. Label accepts default to burst apply when eligible."
+            if not is_run_hybrid_review
+            else "Type a common name or use a recent label button below. Shortcuts: 0, 1-5, K, P, F."
+        )
+        stress_toggle_html = (
+            f"""<label class="toggle"><input id="stress-toggle" type="checkbox" name="stress" value="1" {'checked' if prefill_stress else ''}> (T) mark as stress</label>"""
+            if allow_stress
+            else ""
+        )
+        other_outcomes_html = (
+            f"""
+                  <div class="actions">
+                    <div><strong>Other outcomes</strong></div>
+                    {self._outcome_button(scope['scope_key'], candidate['id'], 'reject', '(R) Reject')}
+                    {self._outcome_button(scope['scope_key'], candidate['id'], 'unsure', 'Unsure')}
+                    {self._outcome_button(scope['scope_key'], candidate['id'], 'not_a_bird', '(N) Not a Bird')}
+                    {self._outcome_button(scope['scope_key'], candidate['id'], 'bad_crop', 'Bad Crop')}
+                    {self._outcome_button(scope['scope_key'], candidate['id'], 'duplicate', 'Duplicate')}
+                    {self._outcome_button(scope['scope_key'], candidate['id'], 'skip', '(K) Skip')}
+                  </div>
+            """
+            if not is_run_hybrid_review
+            else f"""
+                  <div class="actions">
+                    <div><strong>Skip</strong></div>
+                    {self._outcome_button(scope['scope_key'], candidate['id'], 'skip', '(K) Skip')}
+                  </div>
+            """
         )
 
         return f"""
@@ -883,29 +953,21 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
                     <div><strong>Manual label</strong></div>
                     <div class="manual-label-row">
                       <input class="manual-label-input" type="text" name="label_input" placeholder="Type common name" value="{html.escape(prefill_label_input)}">
-                      <div class="form-actions">
-                        <div class="form-actions-left">
-                          <button class="primary" type="submit">{default_save_label}</button>
-                          {f'<button type="submit" formaction="/review" formmethod="post" name="action" value="save">Save Current Only</button>' if burst_target_count else ''}
+                        <div class="form-actions">
+                          <div class="form-actions-left">
+                            <button class="primary" type="submit">{default_save_label}</button>
+                            {f'<button type="submit" formaction="/review" formmethod="post" name="action" value="save">Save Current Only</button>' if allow_burst_apply and burst_target_count else ''}
+                          </div>
+                          {stress_toggle_html}
                         </div>
-                        <label class="toggle"><input id="stress-toggle" type="checkbox" name="stress" value="1" {'checked' if prefill_stress else ''}> (T) mark as stress</label>
-                      </div>
                     </div>
-                    <div class="small">Type a common name or use a recent label button below. Shortcuts: 0, 1-5, R, T, K, N, P, F. Label accepts default to burst apply when eligible.</div>
+                    <div class="small">{shortcut_help}</div>
                   </form>
                   <div class="recent">
                     <div><strong>Recent labels</strong> <span class="small">(1-5)</span></div>
                     {''.join(recent_forms) or '<div class="small">No recent labels yet.</div>'}
                   </div>
-                  <div class="actions">
-                    <div><strong>Other outcomes</strong></div>
-                    {self._outcome_button(scope['scope_key'], candidate['id'], 'reject', '(R) Reject')}
-                    {self._outcome_button(scope['scope_key'], candidate['id'], 'unsure', 'Unsure')}
-                    {self._outcome_button(scope['scope_key'], candidate['id'], 'not_a_bird', '(N) Not a Bird')}
-                    {self._outcome_button(scope['scope_key'], candidate['id'], 'bad_crop', 'Bad Crop')}
-                    {self._outcome_button(scope['scope_key'], candidate['id'], 'duplicate', 'Duplicate')}
-                    {self._outcome_button(scope['scope_key'], candidate['id'], 'skip', '(K) Skip')}
-                  </div>
+                  {other_outcomes_html}
                 </div>
               </div>
               <div class="panel">
@@ -1013,32 +1075,53 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
         overview = summary["overview"]
         outcomes = summary["outcomes"]
         species = summary["species"]
+        is_run_hybrid_review = ReviewAppHandler._is_run_hybrid_review(scope)
 
         overview_rows = "".join(
             f"<tr><td>{html.escape(label.replace('_', ' ').title())}</td><td>{count}</td></tr>"
-            for label, count in [
-                ("unreviewed", overview.get("unreviewed", 0)),
-                ("in_review", overview.get("in_review", 0)),
-                ("skipped", overview.get("skipped", 0)),
-                ("reviewed", overview.get("reviewed", 0)),
-                ("labeled", outcomes.get("labeled", 0)),
-                ("reject", outcomes.get("reject", 0)),
-                ("unsure", outcomes.get("unsure", 0)),
-                ("not_a_bird", outcomes.get("not_a_bird", 0)),
-                ("bad_crop", outcomes.get("bad_crop", 0)),
-                ("duplicate", outcomes.get("duplicate", 0)),
-            ]
+            for label, count in (
+                [
+                    ("unreviewed", overview.get("unreviewed", 0)),
+                    ("in_review", overview.get("in_review", 0)),
+                    ("skipped", overview.get("skipped", 0)),
+                    ("reviewed", overview.get("reviewed", 0)),
+                    ("labeled", outcomes.get("labeled", 0)),
+                ]
+                if is_run_hybrid_review
+                else [
+                    ("unreviewed", overview.get("unreviewed", 0)),
+                    ("in_review", overview.get("in_review", 0)),
+                    ("skipped", overview.get("skipped", 0)),
+                    ("reviewed", overview.get("reviewed", 0)),
+                    ("labeled", outcomes.get("labeled", 0)),
+                    ("reject", outcomes.get("reject", 0)),
+                    ("unsure", outcomes.get("unsure", 0)),
+                    ("not_a_bird", outcomes.get("not_a_bird", 0)),
+                    ("bad_crop", outcomes.get("bad_crop", 0)),
+                    ("duplicate", outcomes.get("duplicate", 0)),
+                ]
+            )
         )
         species_rows = "".join(
-            f"""
-            <tr>
-              <td>{html.escape(row['truth_common_name'] or '')}</td>
-              <td>{html.escape(row['truth_sci_name'] or '')}</td>
-              <td>{row['normal_count']}</td>
-              <td>{row['stress_count']}</td>
-              <td>{row['total_count']}</td>
-            </tr>
-            """
+            (
+                f"""
+                <tr>
+                  <td>{html.escape(row['truth_common_name'] or '')}</td>
+                  <td>{html.escape(row['truth_sci_name'] or '')}</td>
+                  <td>{row['total_count']}</td>
+                </tr>
+                """
+                if is_run_hybrid_review
+                else f"""
+                <tr>
+                  <td>{html.escape(row['truth_common_name'] or '')}</td>
+                  <td>{html.escape(row['truth_sci_name'] or '')}</td>
+                  <td>{row['normal_count']}</td>
+                  <td>{row['stress_count']}</td>
+                  <td>{row['total_count']}</td>
+                </tr>
+                """
+            )
             for row in species
         )
         continue_button = (
@@ -1081,12 +1164,10 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
                 <tr>
                   <th>Common Name</th>
                   <th>Scientific Name</th>
-                  <th>Normal</th>
-                  <th>Stress</th>
-                  <th>Total</th>
+                  {'<th>Total</th>' if is_run_hybrid_review else '<th>Normal</th><th>Stress</th><th>Total</th>'}
                 </tr>
               </thead>
-              <tbody>{species_rows or '<tr><td colspan="5" class="small">No labeled species yet.</td></tr>'}</tbody>
+              <tbody>{species_rows or f'<tr><td colspan="{3 if is_run_hybrid_review else 5}" class="small">No labeled species yet.</td></tr>'}</tbody>
             </table>
           </div>
         </div>
@@ -1172,6 +1253,14 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
         image: dict[str, Any],
         scope: dict[str, Any] | None,
     ) -> SuggestedLabel | None:
+        seeded = self.store.get_seed_suggestion(candidate["id"])
+        if seeded is not None and seeded.get("best_truth_label"):
+            return SuggestedLabel(
+                truth_common_name=seeded.get("best_common_name") or "",
+                truth_sci_name=seeded.get("best_sci_name") or "",
+                truth_label=seeded["best_truth_label"],
+                confidence=float(seeded.get("best_confidence") or 0.0),
+            )
         if self.suggester is None:
             return None
         try:
@@ -1198,9 +1287,9 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
         truth_common_name: str | None = None
         truth_sci_name: str | None = None
 
-        if selected_truth_label and self.label_resolver is not None:
+        if selected_truth_label and self.resolver is not None:
             try:
-                resolved = self.label_resolver.resolve_recent_label(selected_truth_label)
+                resolved = self.resolver.resolve_recent_label(selected_truth_label)
             except UnknownLabelError:
                 resolved = None
             if resolved is not None:

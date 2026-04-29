@@ -214,8 +214,7 @@ def main() -> int:
     from src.classification_log import ClassificationLog
     from src.classifier import Classifier
     from src.geo_filter import GeoFilter, normalize_region, resolve_region_from_coords
-    from src.taxonomy import get_order_display_name, parse_label
-    from src.xmp_writer import write_bird_keywords
+    from src.label_apply import apply_catalog_species_label, species_label_from_prediction, write_sidecar_species_labels
 
     catalog_path = Path(args.catalog)
     if not catalog_path.exists():
@@ -411,50 +410,25 @@ def main() -> int:
                     log.debug(f"[{i}/{len(images)}] RETAG    removed {removed} old tag(s)")
 
                 newly = False
+                label_payloads = [species_label_from_prediction(pred) for pred in confident]
                 for pred in confident:
-                    parsed = parse_label(pred.label)
-                    order = parsed.get("order", "")
-                    family = parsed.get("family", "")
-                    order_display = get_order_display_name(order) if order else ""
-
-                    # Quick-access keyword: Bird-Species > {common_name}
-                    top_id = cat.ensure_bird_species_keyword(pred.common_name)
-                    if cat.tag_image(img.id_local, top_id):
+                    payload = species_label_from_prediction(pred)
+                    if apply_catalog_species_label(cat, img.id_local, payload):
                         newly = True
-
-                    # Birds > Order > {order_display} > {common_name}
-                    ord_id, kw_id = cat.ensure_species_keyword(
-                        order_display or order, pred.common_name
-                    )
-                    cat.tag_image(img.id_local, kw_id)
-                    cat.tag_image(img.id_local, ord_id)
-
-                    # Birds > Scientific > {order} > {family} > {sci_name}
-                    if order and family and pred.sci_name:
-                        ord_kw_id, fam_kw_id, spc_kw_id = cat.ensure_scientific_keywords(
-                            order, family, pred.sci_name
-                        )
-                        cat.tag_image(img.id_local, ord_kw_id)
-                        cat.tag_image(img.id_local, fam_kw_id)
-                        cat.tag_image(img.id_local, spc_kw_id)
-
-                    # Keep XMP sidecar in sync
-                    write_bird_keywords(
-                        path,
-                        pred.common_name,
-                        order_display or order,
-                        order,
-                        family,
-                        pred.sci_name,
-                    )
+                write_sidecar_species_labels(path, label_payloads)
 
                 # Record all confident predictions in the classification log
                 clf_log.record(img.id_local, confident, clf_model_str)
 
                 # Write confidence band keyword for LR smart-collection filtering
                 best_conf = max(p.confidence for p in confident)
-                band_kw_id = cat.ensure_confidence_keyword(confidence_band(best_conf))
-                cat.tag_image(img.id_local, band_kw_id)
+                best_band = confidence_band(best_conf)
+                apply_catalog_species_label(
+                    cat,
+                    img.id_local,
+                    label_payloads[0],
+                    confidence_band_name=best_band,
+                )
 
                 status = "RETAG   " if is_retag else ("TAGGED  " if newly else "EXISTING")
                 label_str = "  |  ".join(
@@ -466,13 +440,10 @@ def main() -> int:
                     retagged += 1
             else:
                 for pred in confident:
-                    parsed = parse_label(pred.label)
-                    order = parsed.get("order", "")
-                    family = parsed.get("family", "")
-                    order_display = get_order_display_name(order) if order else ""
+                    payload = species_label_from_prediction(pred)
                     label = (
                         f"{pred.common_name} ({pred.sci_name})  {pred.confidence:.1%}"
-                        f"  [{order_display} / {family}]"
+                        f"  [{payload.order_display or payload.order} / {payload.family}]"
                     )
                     log.info(f"[{i}/{len(images)}] DRY-RUN  {path.name}  →  {label}")
 

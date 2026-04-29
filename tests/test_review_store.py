@@ -108,6 +108,7 @@ class ReviewStoreTest(unittest.TestCase):
             catalog_name="Catalog",
             catalog_path="/tmp/catalog.lrcat",
             trip_folder="Trip B",
+            workflow_type="run_hybrid_review",
             created_at="2026-04-22T17:00:00Z",
         )
         image_b = self.store.insert_image(
@@ -154,6 +155,23 @@ class ReviewStoreTest(unittest.TestCase):
         )
         self.assertEqual(self.store.count_candidates(scope_key="__default__", review_status="unreviewed"), 1)
         self.assertEqual(self.store.count_candidates(scope_key="scope_b", review_status="unreviewed"), 1)
+
+    def test_scope_workflow_type_round_trips(self) -> None:
+        self.store.ensure_scope(
+            scope_key="scope_hybrid",
+            scope_name="Catalog / Hybrid",
+            catalog_name="Catalog",
+            catalog_path="/tmp/catalog.lrcat",
+            trip_folder="Hybrid",
+            workflow_type="run_hybrid_review",
+            created_at="2026-04-22T17:00:00Z",
+        )
+        scope = self.store.get_scope("scope_hybrid")
+        self.assertIsNotNone(scope)
+        assert scope is not None
+        self.assertEqual(scope["workflow_type"], "run_hybrid_review")
+        listed = {row["scope_key"]: row for row in self.store.list_scopes()}
+        self.assertEqual(listed["scope_hybrid"]["workflow_type"], "run_hybrid_review")
 
     def test_delete_images_by_source_paths_removes_related_rows(self) -> None:
         self.store.insert_candidate(
@@ -711,6 +729,58 @@ class ReviewStoreTest(unittest.TestCase):
         self.store.clear_extraction_cursor("scope-a")
         self.assertIsNone(self.store.get_extraction_cursor("scope-a"))
 
+    def test_seed_suggestion_round_trip(self) -> None:
+        self.store.insert_candidate(
+            {
+                "candidate_id": "cand_seed_1",
+                "image_id": self.image_id,
+                "detector_name": "yolo-bird-v1",
+                "detected_class": "bird",
+                "detector_confidence": 0.93,
+                "bbox_x1": 10,
+                "bbox_y1": 20,
+                "bbox_x2": 110,
+                "bbox_y2": 220,
+                "preview_image_path": str(self.preview_path.resolve()),
+                "review_status": "unreviewed",
+                "created_at": "2026-04-22T17:01:00Z",
+            }
+        )
+        self.store.upsert_seed_suggestion(
+            "cand_seed_1",
+            model="rope_vit_reg4_b14/capi-inat21",
+            best_truth_label="00419_label",
+            best_common_name="Bald Eagle",
+            best_sci_name="Haliaeetus leucocephalus",
+            best_confidence=0.91,
+            top_predictions=[{"truth_label": "00419_label", "confidence": 0.91}],
+            geo_filtered=True,
+            seeded_at="2026-04-22T17:05:00Z",
+        )
+        row = self.store.get_seed_suggestion("cand_seed_1")
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual(row["model"], "rope_vit_reg4_b14/capi-inat21")
+        self.assertEqual(row["best_common_name"], "Bald Eagle")
+        self.assertTrue(row["geo_filtered"])
+        self.assertEqual(row["top_predictions"], [{"truth_label": "00419_label", "confidence": 0.91}])
+
+        self.store.upsert_seed_suggestion(
+            "cand_seed_1",
+            model="manual",
+            best_truth_label="00419_label",
+            best_common_name="Bald Eagle",
+            best_sci_name="Haliaeetus leucocephalus",
+            best_confidence=1.0,
+            top_predictions=None,
+            geo_filtered=False,
+            seeded_at="2026-04-22T17:06:00Z",
+        )
+        updated = self.store.get_seed_suggestion("cand_seed_1")
+        self.assertEqual(updated["model"], "manual")
+        self.assertFalse(updated["geo_filtered"])
+        self.assertIsNone(updated["top_predictions"])
+
     def test_migrates_v1_schema_to_v2(self) -> None:
         legacy_db = self.tmpdir / "legacy.sqlite"
         conn = sqlite3.connect(legacy_db)
@@ -793,6 +863,153 @@ class ReviewStoreTest(unittest.TestCase):
         with ReviewStore(legacy_db) as migrated:
             migrated.set_extraction_cursor("scope-a", "123", "2026-04-22T17:05:00Z")
             self.assertEqual(migrated.get_extraction_cursor("scope-a"), "123")
+
+    def test_migrates_v3_schema_to_v4(self) -> None:
+        legacy_db = self.tmpdir / "legacy_v3.sqlite"
+        conn = sqlite3.connect(legacy_db)
+        conn.executescript(
+            """
+            CREATE TABLE review_scopes (
+                scope_key    TEXT PRIMARY KEY,
+                scope_name   TEXT NOT NULL,
+                catalog_name TEXT NOT NULL,
+                catalog_path TEXT NOT NULL,
+                trip_folder  TEXT NOT NULL,
+                created_at   TEXT NOT NULL,
+                last_opened_at TEXT,
+                status       TEXT NOT NULL DEFAULT 'active',
+                notes        TEXT
+            );
+            CREATE TABLE images (
+                id                   INTEGER PRIMARY KEY,
+                scope_key            TEXT NOT NULL,
+                source_image_id      INTEGER,
+                source_image_path    TEXT NOT NULL,
+                capture_datetime     TEXT,
+                folder               TEXT,
+                rating               REAL,
+                gps_lat              REAL,
+                gps_lon              REAL,
+                region_hint          TEXT,
+                lens_model           TEXT,
+                focal_length         REAL,
+                existing_keywords    TEXT,
+                burst_group_id       TEXT,
+                near_duplicate_group TEXT,
+                created_at           TEXT NOT NULL
+            );
+            CREATE TABLE candidates (
+                id TEXT PRIMARY KEY,
+                image_id INTEGER NOT NULL,
+                detector_name TEXT NOT NULL,
+                detected_class TEXT NOT NULL,
+                detector_confidence REAL NOT NULL,
+                bbox_x1 INTEGER NOT NULL,
+                bbox_y1 INTEGER NOT NULL,
+                bbox_x2 INTEGER NOT NULL,
+                bbox_y2 INTEGER NOT NULL,
+                bbox_area_fraction REAL,
+                preview_image_path TEXT NOT NULL,
+                safe_single_subject_burst INTEGER NOT NULL DEFAULT 0,
+                review_status TEXT NOT NULL DEFAULT 'unreviewed',
+                reviewed_at TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE annotations (
+                candidate_id TEXT PRIMARY KEY,
+                annotation_status TEXT NOT NULL,
+                truth_common_name TEXT,
+                truth_sci_name TEXT,
+                truth_label TEXT,
+                taxon_class TEXT,
+                resolved_from_input TEXT,
+                stress INTEGER NOT NULL DEFAULT 0,
+                reject_sample INTEGER NOT NULL DEFAULT 0,
+                unsure INTEGER NOT NULL DEFAULT 0,
+                not_a_bird INTEGER NOT NULL DEFAULT 0,
+                bad_crop INTEGER NOT NULL DEFAULT 0,
+                duplicate_sample INTEGER NOT NULL DEFAULT 0,
+                notes TEXT,
+                annotated_by TEXT,
+                annotated_at TEXT NOT NULL
+            );
+            CREATE TABLE label_history (
+                id INTEGER PRIMARY KEY,
+                truth_common_name TEXT NOT NULL,
+                truth_sci_name TEXT NOT NULL,
+                truth_label TEXT NOT NULL,
+                taxon_class TEXT,
+                used_at TEXT NOT NULL
+            );
+            CREATE TABLE review_sessions (
+                id INTEGER PRIMARY KEY,
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                user_id TEXT,
+                queue_filter TEXT,
+                notes TEXT
+            );
+            CREATE TABLE extraction_cursors (
+                scope_key TEXT PRIMARY KEY,
+                cursor_value TEXT,
+                updated_at TEXT NOT NULL
+            );
+            PRAGMA user_version = 3;
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        with ReviewStore(legacy_db) as migrated:
+            migrated.ensure_scope(
+                scope_key="scope_v4",
+                scope_name="Catalog / Scope",
+                catalog_name="Catalog",
+                catalog_path="/tmp/catalog.lrcat",
+                trip_folder="Scope",
+                workflow_type="run_hybrid_review",
+                created_at="2026-04-22T17:00:00Z",
+            )
+            image_id = migrated.insert_image(
+                {
+                    "scope_key": "scope_v4",
+                    "source_image_id": 111,
+                    "source_image_path": str((self.tmpdir / "legacy_v4.ARW").resolve()),
+                    "capture_datetime": "2026-04-22T17:00:00Z",
+                    "folder": str(self.tmpdir.resolve()),
+                    "created_at": "2026-04-22T17:00:00Z",
+                }
+            )
+            migrated.insert_candidate(
+                {
+                    "candidate_id": "cand_v4",
+                    "image_id": image_id,
+                    "detector_name": "seeded",
+                    "detected_class": "bird",
+                    "detector_confidence": 0.5,
+                    "bbox_x1": 0,
+                    "bbox_y1": 0,
+                    "bbox_x2": 10,
+                    "bbox_y2": 10,
+                    "preview_image_path": str(self.preview_path.resolve()),
+                    "review_status": "unreviewed",
+                    "created_at": "2026-04-22T17:00:00Z",
+                }
+            )
+            migrated.upsert_seed_suggestion(
+                "cand_v4",
+                model="manual",
+                best_truth_label=None,
+                best_common_name=None,
+                best_sci_name=None,
+                best_confidence=None,
+                top_predictions=None,
+                geo_filtered=False,
+                seeded_at="2026-04-22T17:05:00Z",
+            )
+            scope = migrated.get_scope("scope_v4")
+            self.assertEqual(scope["workflow_type"], "run_hybrid_review")
+            self.assertIsNotNone(migrated.get_seed_suggestion("cand_v4"))
 
     def test_queue_opens_unreviewed_candidate(self) -> None:
         self.store.insert_candidate(

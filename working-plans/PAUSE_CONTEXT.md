@@ -195,3 +195,145 @@ The working design stack lives here:
 - `working-plans/ANNOTATION_REVIEW_UI.md`
 - `working-plans/ANNOTATION_EVAL_BUILD_PLAN.md`
 - `working-plans/INITIAL_USER_TESTING_CHECKLIST.md`
+
+## Review Run / Apply Pickup
+
+This section captures the newer regular-user attended review work so it can be
+resumed cleanly without re-deriving intent from chat history.
+
+### Product Direction Locked In
+
+There are now two distinct review consumers:
+
+- `src.review_app`
+  - expert-oriented
+  - used to build ground-truth / evaluation datasets
+  - retains expert outcomes like `reject`, `unsure`, `not_a_bird`,
+    `bad_crop`, `duplicate`, and `stress`
+
+- `src.review_run`
+  - not implemented yet at pause
+  - regular-user attended tagging workflow
+  - should auto-apply high-confidence results
+  - should defer lower-confidence images into `review_app`
+  - should expose only `Save Label` and `Skip` in the review UI
+
+The architectural plan for this is written in:
+
+- `working-plans/REVIEW_RUN_IMPLEMENTATION_PLAN.md`
+
+Recent planning commits relevant to this work:
+
+- `df07694` `Add review-run implementation plan`
+- `f3255ed` `Refine review-run UI workflow plan`
+- `c8c45f4` `Update review-run plan for UI split`
+
+### Code Completed In This Slice
+
+The following foundational work is implemented but not committed yet:
+
+- new shared label writer:
+  - `src/label_apply.py`
+- `src.run` refactored to use the shared writer
+- `src.tag_bird` refactored to use the shared writer
+- `src.review_store` schema bumped to v4
+  - adds `review_scopes.workflow_type`
+  - adds `candidate_seed_suggestions`
+- `src.review_app` now has first-pass workflow-aware behavior:
+  - `run_hybrid_review` only allows `save` and `skip`
+  - server-side action validation rejects expert-only actions for that workflow
+  - hybrid scopes hide stress / reject-style actions in the candidate view
+  - hybrid scopes show a simplified summary
+  - seeded suggestions are preferred before live classifier suggestions
+- `src.catalog` now has `get_managed_keyword_names_for_image(...)`
+
+Tests added/updated:
+
+- `tests/test_label_apply.py`
+- `tests/test_review_store.py`
+- `tests/test_review_app_local.py`
+
+### Verified State At Pause
+
+Focused checks that passed after the above changes:
+
+```bash
+python -m unittest tests.test_review_store tests.test_label_apply tests.test_review_app_local
+python -m py_compile src/label_apply.py src/run.py src/tag_bird.py src/review_store.py src/review_app.py
+```
+
+Note:
+
+- one test run emitted a network-resolution warning from the eBird reference
+  path during `tests.test_review_app_local`, but the suite still passed
+
+### Worktree State At Pause
+
+Uncommitted modified files:
+
+- `src/catalog.py`
+- `src/review_app.py`
+- `src/review_store.py`
+- `src/run.py`
+- `src/tag_bird.py`
+- `tests/test_review_app_local.py`
+- `tests/test_review_store.py`
+
+Untracked new files:
+
+- `src/label_apply.py`
+- `tests/test_label_apply.py`
+
+### What Was In Progress When Paused
+
+The next implementation slice had started conceptually but not yet landed:
+
+1. `src.review_run`
+   - new orchestration CLI
+   - reuse current `run.py` image-selection / classifier / geo-filter behavior
+   - auto-apply high-confidence images
+   - seed low-confidence images into `review.db`
+   - optionally host or launch `review_app`
+   - after review, run reviewed-label apply
+
+2. `src.apply_review_labels`
+   - standalone expert / utility CLI
+   - bulk apply reviewed labels from `review.db` to Lightroom
+
+3. shared apply engine / state:
+   - `src/review_apply.py`
+   - `src/review_apply_state.py`
+
+No files for those modules were created before pause.
+
+### Recommended Next Steps
+
+Resume in this order:
+
+1. commit or stash the currently uncommitted foundation changes before starting
+   the next slice
+2. add `src/review_apply_state.py`
+   - small SQLite ledger for apply runs and image-level fingerprints
+3. add `src/review_apply.py`
+   - query reviewed rows from `review.db`
+   - group by image
+   - consolidate to desired image-level outcomes
+   - compare desired state to Lightroom current managed state using
+     `get_managed_keyword_names_for_image(...)`
+   - apply only when needed
+4. add `src/apply_review_labels.py`
+   - thin CLI around the shared apply engine
+5. add `src/review_run.py`
+   - use existing `run.py` logic as the model
+   - add review DB seeding for low-confidence images
+   - reuse `review_app` for the interactive phase
+
+### Important Constraints To Preserve
+
+- `src.run` stays the unattended entrypoint
+- `src.review_app` does not write to Lightroom directly
+- `run_hybrid_review` in `review_app` must remain label-and-skip only
+- apply logic must always check Lightroom state directly for idempotency, even
+  if an apply-state DB exists
+- the shared writer in `src/label_apply.py` should remain the only place where
+  managed Lightroom/XMP write semantics live
