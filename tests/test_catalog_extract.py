@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from PIL import Image
+from PIL import UnidentifiedImageError
 
 from src.catalog_extract import CatalogExtractor, Detection, SequenceMetadata
 from src.catalog import CatalogImage
@@ -98,6 +99,45 @@ class FakeCatalog:
 
 
 class CatalogExtractorTest(unittest.TestCase):
+    def test_extract_derives_scope_from_catalog_and_trip_folder(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        tmpdir = Path(tmp.name)
+        db_path = tmpdir / "review.sqlite"
+        raw_dir = tmpdir / "Photos" / "2026" / "VeroBeach" / "2026-04-04" / "a9iii-1"
+        raw_dir.mkdir(parents=True)
+        raw_path = raw_dir / "source.ARW"
+        raw_path.write_bytes(b"raw")
+
+        store = ReviewStore(db_path)
+        self.addCleanup(store.close)
+
+        image = CatalogImage(
+            id_local=123,
+            file_path=str(raw_path.resolve()),
+            file_format="RAW",
+            base_name="source",
+            extension="ARW",
+            rating=4.0,
+            color_label=None,
+            capture_time="2026-04-22T17:00:00Z",
+        )
+        fake_catalog = FakeCatalog([image])
+        extractor = CatalogExtractor(store, FakeDetector(), FakePreviewProvider(tmpdir))
+
+        with patch("src.catalog_extract.LightroomCatalog.open", return_value=fake_catalog):
+            extractor.extract(
+                tmpdir / "Wildlife 1stars.lrcat",
+                created_at="2026-04-22T17:05:00Z",
+            )
+
+        scopes = store.list_scopes()
+        self.assertEqual(len(scopes), 1)
+        self.assertEqual(
+            scopes[0]["scope_name"],
+            f"Wildlife 1stars / {(tmpdir / 'Photos' / '2026' / 'VeroBeach').resolve()}",
+        )
+
     def test_extract_populates_store(self) -> None:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -206,6 +246,41 @@ class CatalogExtractorTest(unittest.TestCase):
                 )
 
         mocked_load_image.assert_called_once()
+
+    def test_extract_skips_unreadable_image_without_failing(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        tmpdir = Path(tmp.name)
+        db_path = tmpdir / "review.sqlite"
+        raw_path = tmpdir / "broken.tif"
+        raw_path.write_bytes(b"not-an-image")
+
+        store = ReviewStore(db_path)
+        self.addCleanup(store.close)
+
+        image = CatalogImage(
+            id_local=123,
+            file_path=str(raw_path.resolve()),
+            file_format="TIFF",
+            base_name="broken",
+            extension="tif",
+            rating=4.0,
+            color_label=None,
+            capture_time="2026-04-22T17:00:00Z",
+        )
+        fake_catalog = FakeCatalog([image])
+        extractor = CatalogExtractor(store, FakePreloadedDetector(), FakePreloadedPreviewProvider(tmpdir))
+
+        with patch("src.catalog_extract.LightroomCatalog.open", return_value=fake_catalog):
+            with patch("src.catalog_extract.load_image", side_effect=UnidentifiedImageError("bad image")):
+                images_inserted, candidates_inserted, last_image_id = extractor.extract(
+                    "/tmp/does-not-matter.lrcat",
+                    created_at="2026-04-22T17:05:00Z",
+                )
+
+        self.assertEqual(images_inserted, 1)
+        self.assertEqual(candidates_inserted, 0)
+        self.assertEqual(last_image_id, 123)
 
     def test_extract_marks_only_dominant_detection_as_burst_safe(self) -> None:
         tmp = tempfile.TemporaryDirectory()

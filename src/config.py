@@ -9,7 +9,7 @@ Supported keys
 --------------
 catalog        str   — default path to the .lrcat file
 region         str   — default region hint (e.g. "us_northeast", "US")
-formats        str   — default comma-separated format list (e.g. "RAW,DNG")
+formats        str   — default comma-separated format list (e.g. "RAW,DNG,PSD")
 model          str   — default model in "network/tag" form
 min_confidence float — default minimum confidence threshold (0–1)
 
@@ -18,7 +18,7 @@ Example ~/.lrbc-config
 {
     "catalog": "/Volumes/Photos/My Catalog.lrcat",
     "region": "us_northeast",
-    "formats": "RAW,DNG",
+    "formats": "RAW,DNG,PSD",
     "model": "rope_vit_reg4_b14/capi-inat21",
     "min_confidence": 0.25
 }

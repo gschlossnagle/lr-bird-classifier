@@ -21,12 +21,13 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .catalog_extract import CatalogExtractor
-from .extract_candidates import _load_object, _scope_key
+from .extract_candidates import _build_detector, _load_object, _scope_key
 from .label_resolver import AmbiguousLabelError, LabelResolver, ResolvedLabel, UnknownLabelError
 from .review_queue import QueueFilters, ReviewQueue
 from .review_assets import BoxedPreviewProvider
 from .review_suggester import ReviewSuggester, SuggestedLabel
 from .review_store import ReviewStore
+from .subject_size_estimate import estimated_subject_box_size_for_candidate
 
 STRESS_SUGGESTION_CONFIDENCE_THRESHOLD = 0.35
 log = logging.getLogger(__name__)
@@ -41,13 +42,16 @@ class QueueTopUpRunner:
         preview_dir: str,
         formats: set[str],
         folder: str | None,
+        scope_folder: str | None,
         min_stars: int | None,
         batch_limit: int,
         max_preview_dimension: int,
         jpeg_quality: int,
+        detector_model: str | None = None,
+        verbose: bool = False,
     ) -> None:
         detector_factory = _load_object(detector_import_path)
-        detector = detector_factory()
+        detector = _build_detector(detector_factory, model=detector_model)
         provider = BoxedPreviewProvider(
             preview_dir,
             max_dimension=max_preview_dimension,
@@ -55,39 +59,82 @@ class QueueTopUpRunner:
         )
         self.extractor = CatalogExtractor(None, detector, provider)  # store injected per run
         self.catalog = catalog
+        self.catalog_path = str(Path(catalog).resolve())
         self.formats = formats
         self.folder = folder
+        self.scope_folder = scope_folder
         self.min_stars = min_stars
         self.batch_limit = batch_limit
-        self.scope_key = _scope_key(
-            catalog=catalog,
-            folder=folder,
-            min_stars=min_stars,
-            formats=formats,
-        )
+        self.verbose = verbose
 
-    def top_up(self, store: ReviewStore) -> tuple[int, int]:
+    def top_up(self, store: ReviewStore, active_scope: dict[str, Any] | None = None) -> tuple[int, int]:
         from datetime import UTC, datetime
 
-        created_at = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        active_trip_folder = active_scope["trip_folder"] if active_scope else None
+        effective_scope_folder = self.scope_folder or active_trip_folder
+        effective_folder = self.folder
+        if effective_folder is None and active_scope is not None:
+            effective_folder = active_trip_folder
+        extraction_scope_key = _scope_key(
+            catalog=self.catalog,
+            folder=effective_folder,
+            scope_folder=effective_scope_folder,
+            min_stars=self.min_stars,
+            formats=self.formats,
+        )
         start_after_id: int | None = None
-        cursor = store.get_extraction_cursor(self.scope_key)
+        cursor = store.get_extraction_cursor(extraction_scope_key)
         if cursor is not None:
             start_after_id = int(cursor)
 
         self.extractor.store = store
-        images_scanned, candidates_created, last_image_id = self.extractor.extract(
-            self.catalog,
-            formats=self.formats,
-            folder_filter=self.folder,
-            min_rating=self.min_stars,
-            start_after_id=start_after_id,
-            limit=self.batch_limit,
-            created_at=created_at,
-        )
-        if last_image_id is not None:
-            store.set_extraction_cursor(self.scope_key, str(last_image_id), created_at)
-        return images_scanned, candidates_created
+        images_total = 0
+        candidates_total = 0
+
+        def _queue_depth() -> int:
+            if active_scope is not None:
+                return store.count_candidate_images(
+                    scope_key=active_scope["scope_key"],
+                    review_status="unreviewed",
+                )
+            return sum(
+                int(scope.get("unreviewed_image_count") or 0)
+                for scope in store.list_scopes()
+                if scope.get("catalog_path") == self.catalog_path
+            )
+
+        while _queue_depth() < self.batch_limit:
+            created_at = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            images_scanned, candidates_created, last_image_id = self.extractor.extract(
+                self.catalog,
+                formats=self.formats,
+                folder_filter=effective_folder,
+                scope_folder_override=effective_scope_folder,
+                min_rating=self.min_stars,
+                start_after_id=start_after_id,
+                limit=self.batch_limit,
+                created_at=created_at,
+                verbose=self.verbose,
+            )
+            images_total += images_scanned
+            candidates_total += candidates_created
+            if last_image_id is not None:
+                start_after_id = last_image_id
+                store.set_extraction_cursor(extraction_scope_key, str(last_image_id), created_at)
+            if images_scanned == 0:
+                break
+        return images_total, candidates_total
+
+    def needs_scope_discovery(self, scopes: list[dict[str, Any]]) -> bool:
+        catalog_scopes = [scope for scope in scopes if scope.get("catalog_path") == self.catalog_path]
+        if not catalog_scopes:
+            return True
+
+        scope_hint = self.scope_folder or self.folder
+        if scope_hint and not any(scope.get("trip_folder") == scope_hint for scope in catalog_scopes):
+            return True
+
+        return False
 
 
 class QueueTopUpError(RuntimeError):
@@ -101,8 +148,9 @@ class QueueTopUpCoordinator:
         self._last_error: str | None = None
         self._last_images_scanned = 0
         self._last_candidates_created = 0
+        self._scope_key: str | None = None
 
-    def ensure_running(self, store: ReviewStore, runner: QueueTopUpRunner) -> bool:
+    def ensure_running(self, store: ReviewStore, runner: QueueTopUpRunner, active_scope: dict[str, Any] | None = None) -> bool:
         with self._lock:
             if self._running:
                 return False
@@ -110,22 +158,27 @@ class QueueTopUpCoordinator:
             self._last_error = None
             self._last_images_scanned = 0
             self._last_candidates_created = 0
+            self._scope_key = active_scope["scope_key"] if active_scope else None
+        log.info(
+            "Starting automatic top-up for %s",
+            active_scope["scope_name"] if active_scope else f"catalog discovery: {runner.catalog_path}",
+        )
 
         thread = threading.Thread(
             target=self._run,
-            args=(store, runner),
+            args=(store, runner, active_scope),
             daemon=True,
             name="review-topup",
         )
         thread.start()
         return True
 
-    def _run(self, store: ReviewStore, runner: QueueTopUpRunner) -> None:
+    def _run(self, store: ReviewStore, runner: QueueTopUpRunner, active_scope: dict[str, Any] | None) -> None:
         images_total = 0
         candidates_total = 0
         try:
             while True:
-                images_scanned, candidates_created = runner.top_up(store)
+                images_scanned, candidates_created = runner.top_up(store, active_scope)
                 images_total += images_scanned
                 candidates_total += candidates_created
                 if candidates_created > 0 or images_scanned == 0:
@@ -137,13 +190,21 @@ class QueueTopUpCoordinator:
                 self._last_error = str(exc)
                 self._last_images_scanned = images_total
                 self._last_candidates_created = candidates_total
+                self._scope_key = active_scope["scope_key"] if active_scope else None
             return
 
+        log.info(
+            "Finished automatic top-up for %s: scanned=%s candidates=%s",
+            active_scope["scope_name"] if active_scope else f"catalog discovery: {runner.catalog_path}",
+            images_total,
+            candidates_total,
+        )
         with self._lock:
             self._running = False
             self._last_error = None
             self._last_images_scanned = images_total
             self._last_candidates_created = candidates_total
+            self._scope_key = active_scope["scope_key"] if active_scope else None
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -152,6 +213,7 @@ class QueueTopUpCoordinator:
                 "last_error": self._last_error,
                 "last_images_scanned": self._last_images_scanned,
                 "last_candidates_created": self._last_candidates_created,
+                "scope_key": self._scope_key,
             }
 
 
@@ -248,13 +310,9 @@ document.addEventListener('keydown', function (event) {{
   }}
 
   if ((event.key === 'r' || event.key === 'R') && !event.metaKey && !event.ctrlKey && !isTextInput) {{
-    const form = document.querySelector('form[data-recent-index="1"]');
+    const form = document.querySelector('form[data-action="reject"]');
     if (form) {{
-      const truthLabel = form.getAttribute('data-truth-label');
       event.preventDefault();
-      if (truthLabel && submitResolvedLabel(truthLabel)) {{
-        return;
-      }}
       form.submit();
       return;
     }}
@@ -283,6 +341,14 @@ document.addEventListener('keydown', function (event) {{
 
   if (!isTextInput && (event.key === 'k' || event.key === 'K')) {{
     const form = document.querySelector('form[data-action="skip"]');
+    if (form) {{
+      event.preventDefault();
+      form.submit();
+    }}
+  }}
+
+  if (!isTextInput && (event.key === 'n' || event.key === 'N')) {{
+    const form = document.querySelector('form[data-action="not_a_bird"]');
     if (form) {{
       event.preventDefault();
       form.submit();
@@ -323,8 +389,11 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
         if parsed.path in {"/", "/review"}:
             self._handle_review_get(parsed)
             return
+        if parsed.path == "/scopes":
+            self._handle_scopes_get(parsed)
+            return
         if parsed.path == "/summary":
-            self._handle_summary_get()
+            self._handle_summary_get(parsed)
             return
         if parsed.path.startswith("/preview/"):
             self._handle_preview(parsed.path.removeprefix("/preview/"))
@@ -339,8 +408,16 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def _handle_review_get(self, parsed) -> None:
-        self._maybe_start_background_top_up()
         params = parse_qs(parsed.query)
+        scope_key = params.get("scope", [None])[0]
+        scope = self._resolve_scope(scope_key)
+        if scope is None:
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", "/scopes")
+            self.end_headers()
+            return
+        self.store.touch_scope(scope["scope_key"], _utc_now())
+        self._maybe_start_background_top_up(scope)
         candidate_id = params.get("id", [None])[0]
         error = params.get("error", [""])[0]
         prefill_selected_truth_label = params.get("selected_truth_label", [""])[0]
@@ -349,29 +426,29 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
         prefill_notes = params.get("notes", [""])[0]
         stress_reason = params.get("stress_reason", [""])[0]
 
-        queue = ReviewQueue(self.store, QueueFilters(review_status="unreviewed"))
+        queue = ReviewQueue(self.store, QueueFilters(scope_key=scope["scope_key"], review_status="unreviewed"))
         if candidate_id is None:
             next_candidate = queue.next_candidate()
             if next_candidate is None:
                 status = self._top_up_status()
                 if self.topup_runner is not None and self.topup_coordinator is not None:
                     if not status["running"]:
-                        self.topup_coordinator.ensure_running(self.store, self.topup_runner)
+                        self.topup_coordinator.ensure_running(self.store, self.topup_runner, scope)
                         status = self._top_up_status()
-                    if status["running"]:
-                        self._write_html("Queue Top-Up", self._render_top_up_pending(status))
+                    if status["running"] and status.get("scope_key") in {None, scope["scope_key"]}:
+                        self._write_html("Queue Top-Up", self._render_top_up_pending(status, scope["scope_key"]))
                         return
                     next_candidate = queue.next_candidate()
                 if status["last_error"]:
-                    self._write_html("Top-Up Failed", self._render_top_up_failed(status["last_error"]))
+                    self._write_html("Top-Up Failed", self._render_top_up_failed(status["last_error"], scope["scope_key"]))
                     return
                 if next_candidate is None:
                     self.send_response(HTTPStatus.SEE_OTHER)
-                    self.send_header("Location", "/summary")
+                    self.send_header("Location", f"/summary?scope={_q(scope['scope_key'])}")
                     self.end_headers()
                     return
             self.send_response(HTTPStatus.SEE_OTHER)
-            self.send_header("Location", f"/review?id={next_candidate['id']}")
+            self.send_header("Location", f"/review?scope={_q(scope['scope_key'])}&id={next_candidate['id']}")
             self.end_headers()
             return
 
@@ -383,15 +460,17 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
         image = self.store.get_image(candidate["image_id"]) or {}
         annotation = self.store.get_annotation(candidate_id)
         recent = self.store.recent_labels(limit=5)
-        prev_candidate = self.store.previous_reviewed_candidate(candidate_id)
+        prev_candidate = self.store.previous_reviewed_candidate(candidate_id, scope_key=scope["scope_key"])
         burst_targets = self.store.burst_candidates(candidate_id, include_reviewed=False)
         burst_position = self.store.burst_position(candidate_id)
-        queue_position = self.store.queue_position(candidate_id, review_status="unreviewed")
-        unreviewed_candidates = self.store.count_candidates(review_status="unreviewed")
-        unreviewed_images = self.store.count_candidate_images(review_status="unreviewed")
+        queue_position = self.store.queue_position(candidate_id, scope_key=scope["scope_key"], review_status="unreviewed")
+        unreviewed_candidates = self.store.count_candidates(scope_key=scope["scope_key"], review_status="unreviewed")
+        unreviewed_images = self.store.count_candidate_images(scope_key=scope["scope_key"], review_status="unreviewed")
         suggestion = self._build_suggestion(candidate, image)
+        estimated_subject_box_size = self._estimated_subject_box_size(candidate, image)
 
         body = self._render_candidate(
+            scope,
             candidate,
             image,
             annotation,
@@ -404,6 +483,7 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
             unreviewed_images,
             unreviewed_candidates,
             suggestion,
+            estimated_subject_box_size,
             self.suggestion_status,
             prefill_selected_truth_label,
             prefill_label_input,
@@ -413,13 +493,46 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
         )
         self._write_html("Review Candidate", body)
 
-    def _handle_summary_get(self) -> None:
-        self._maybe_start_background_top_up()
-        queue = ReviewQueue(self.store, QueueFilters(review_status="unreviewed"))
+    def _handle_summary_get(self, parsed) -> None:
+        params = parse_qs(parsed.query)
+        scope = self._resolve_scope(params.get("scope", [None])[0])
+        if scope is None:
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", "/scopes")
+            self.end_headers()
+            return
+        self.store.touch_scope(scope["scope_key"], _utc_now())
+        self._maybe_start_background_top_up(scope)
+        queue = ReviewQueue(self.store, QueueFilters(scope_key=scope["scope_key"], review_status="unreviewed"))
         next_candidate = queue.next_candidate()
-        summary = self.store.summary_counts()
-        body = self._render_summary(summary, next_candidate["id"] if next_candidate else None, self._top_up_status())
+        summary = self.store.summary_counts(scope_key=scope["scope_key"])
+        body = self._render_summary(scope, summary, next_candidate["id"] if next_candidate else None, self._top_up_status())
         self._write_html("Review Summary", body)
+
+    def _handle_scopes_get(self, parsed) -> None:
+        scopes = self.store.list_scopes()
+        if self.topup_runner is not None and self.topup_coordinator is not None:
+            total_unreviewed = self.store.count_candidates(review_status="unreviewed")
+            status = self._top_up_status()
+            only_legacy_scopes = bool(scopes) and all(scope["scope_key"] == "__legacy__" for scope in scopes)
+            needs_discovery = self.topup_runner.needs_scope_discovery(scopes)
+            if (
+                total_unreviewed <= self.topup_low_watermark
+                or only_legacy_scopes
+                or not scopes
+                or needs_discovery
+            ) and not status["running"]:
+                log.info(
+                    "Scopes page triggered automatic discovery: total_unreviewed=%s watermark=%s only_legacy=%s needs_discovery=%s",
+                    total_unreviewed,
+                    self.topup_low_watermark,
+                    only_legacy_scopes,
+                    needs_discovery,
+                )
+                self.topup_coordinator.ensure_running(self.store, self.topup_runner, None)
+                scopes = self.store.list_scopes()
+        body = self._render_scopes(scopes, self._top_up_status())
+        self._write_html("Review Scopes", body)
 
     def _top_up_status(self) -> dict[str, Any]:
         if self.topup_coordinator is None:
@@ -431,16 +544,20 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
             }
         return self.topup_coordinator.snapshot()
 
-    def _maybe_start_background_top_up(self) -> None:
+    def _maybe_start_background_top_up(self, scope: dict[str, Any] | None) -> None:
         if self.topup_runner is None or self.topup_coordinator is None:
             return
-        unreviewed = self.store.count_candidates(review_status="unreviewed")
-        if unreviewed <= self.topup_low_watermark:
-            self.topup_coordinator.ensure_running(self.store, self.topup_runner)
+        if scope is None:
+            return
+        unreviewed = self.store.count_candidates(scope_key=scope["scope_key"], review_status="unreviewed")
+        status = self._top_up_status()
+        if unreviewed <= self.topup_low_watermark and (not status["running"] or status.get("scope_key") == scope["scope_key"]):
+            self.topup_coordinator.ensure_running(self.store, self.topup_runner, scope)
 
     def _handle_review_post(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
         payload = parse_qs(self.rfile.read(length).decode("utf-8"))
+        scope_key = payload.get("scope_key", [""])[0]
         candidate_id = payload.get("candidate_id", [""])[0]
         action = payload.get("action", [""])[0]
         label_input = payload.get("label_input", [""])[0]
@@ -496,6 +613,7 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
         except (UnknownLabelError, AmbiguousLabelError, ValueError) as e:
             self._redirect_review(
                 candidate_id,
+                scope_key=scope_key,
                 error=str(e),
                 selected_truth_label=selected_truth_label,
                 label_input=label_input,
@@ -505,13 +623,23 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
             return
 
         self.send_response(HTTPStatus.SEE_OTHER)
-        self.send_header("Location", "/review")
+        self.send_header("Location", f"/review?scope={_q(scope_key)}")
         self.end_headers()
 
     def _resolve_label(self, selected_truth_label: str, label_input: str) -> ResolvedLabel:
         if selected_truth_label:
             return self.resolver.resolve_recent_label(selected_truth_label)
         return self.resolver.resolve_common_name(label_input)
+
+    @staticmethod
+    def _estimated_subject_box_size(candidate: dict[str, Any], image: dict[str, Any]) -> tuple[float, float] | None:
+        image_path = image.get("source_image_path")
+        if not image_path:
+            return None
+        try:
+            return estimated_subject_box_size_for_candidate(image_path, candidate)
+        except Exception:
+            return None
 
     def _handle_preview(self, candidate_id: str) -> None:
         candidate = self.store.get_candidate(candidate_id)
@@ -531,6 +659,7 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
 
     def _render_candidate(
         self,
+        scope: dict[str, Any],
         candidate: dict[str, Any],
         image: dict[str, Any],
         annotation: dict[str, Any] | None,
@@ -543,6 +672,7 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
         unreviewed_images: int,
         unreviewed_candidates: int,
         suggestion: SuggestedLabel | None,
+        estimated_subject_box_size: tuple[float, float] | None,
         suggestion_status: str | None,
         prefill_selected_truth_label: str,
         prefill_label_input: str,
@@ -560,11 +690,12 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
             recent_forms.append(
                 f"""
                 <form method="post" action="/review" data-recent-index="{idx}" data-truth-label="{html.escape(row['truth_label'])}">
+                  <input type="hidden" name="scope_key" value="{html.escape(scope['scope_key'])}">
                   <input type="hidden" name="candidate_id" value="{html.escape(candidate['id'])}">
                   <input type="hidden" name="action" value="{default_save_action}">
                   <input type="hidden" name="selected_truth_label" value="{html.escape(row['truth_label'])}">
                   <input type="hidden" name="stress" value="0">
-                  <button type="submit">{idx}. {html.escape(row['truth_common_name'])}</button>
+                  <button type="submit">({idx}) {html.escape(row['truth_common_name'])}</button>
                 </form>
                 """
             )
@@ -592,11 +723,12 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
             <div class="resolved">
               <div><strong>Classifier suggestion</strong>: {html.escape(suggestion.truth_common_name)} ({html.escape(suggestion.truth_sci_name)}) {suggestion.confidence:.1%}</div>
               <form method="post" action="/review" data-suggestion="true" data-truth-label="{html.escape(suggestion.truth_label)}" style="margin-top:8px;">
+                <input type="hidden" name="scope_key" value="{html.escape(scope['scope_key'])}">
                 <input type="hidden" name="candidate_id" value="{html.escape(candidate['id'])}">
                 <input type="hidden" name="action" value="{default_save_action}">
                 <input type="hidden" name="selected_truth_label" value="{html.escape(suggestion.truth_label)}">
                 <input type="hidden" name="stress" value="0">
-                <button type="submit">0. Accept Suggestion</button>
+                <button type="submit">(0) Accept Suggestion</button>
               </form>
             </div>
             """
@@ -615,12 +747,20 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
               <div class="small">{html.escape(stress_reason)}</div>
             </div>
             """
+        estimated_size_html = ""
+        if estimated_subject_box_size is not None:
+            estimated_size_html = (
+                f"<div><strong>Estimated subject box size:</strong> "
+                f"{estimated_subject_box_size[0]:.1f} cm × {estimated_subject_box_size[1]:.1f} cm</div>"
+                "<div class='small'>Approximate, assuming the boxed subject is at the focus distance.</div>"
+            )
 
         return f"""
         <div class="wrap">
           <div class="panel preview-panel">
             <div class="nav">
-              <a href="/summary"><button type="button">Summary</button></a>
+              <a href="/scopes"><button type="button">Scopes</button></a>
+              <a href="/summary?scope={_q(scope['scope_key'])}"><button type="button">Summary</button></a>
             </div>
             <div class="preview-frame">
               <img src="/preview/{html.escape(candidate['id'])}" alt="preview">
@@ -628,15 +768,18 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
           </div>
           <div class="panel">
             <div class="nav">
-              <a href="/summary"><button type="button">Summary</button></a>
+              <a href="/scopes"><button type="button">Switch Scope</button></a>
+              <a href="/summary?scope={_q(scope['scope_key'])}"><button type="button">Summary</button></a>
             </div>
             <div class="meta">
+              <div><strong>Scope:</strong> {html.escape(scope['scope_name'])}</div>
               <div><strong>Candidate:</strong> <code>{html.escape(candidate['id'])}</code></div>
               <div><strong>Source:</strong> <code>{html.escape(str(image.get('source_image_path', '')))}</code></div>
               <div><strong>Captured:</strong> {html.escape(str(image.get('capture_datetime', '')))}</div>
               <div><strong>Detector:</strong> {html.escape(str(candidate.get('detector_name', '')))} @ {candidate.get('detector_confidence', 0):.2f}</div>
               <div><strong>Region:</strong> {html.escape(str(image.get('region_hint', '')))}</div>
               <div><strong>Burst:</strong> {html.escape(str(image.get('burst_group_id', '')))}{html.escape(burst_label)}</div>
+              {estimated_size_html}
               <div><strong>Queue Position:</strong> {html.escape(f'{queue_position[0]}/{queue_position[1]}' if queue_position else 'n/a')}</div>
               <div><strong>Queue Depth:</strong> {unreviewed_images} image(s), {unreviewed_candidates} candidate(s) yolo'd and waiting</div>
               <div class="small">{'This candidate has ' + str(burst_target_count) + ' other safe burst item(s), so label actions default to burst apply.' if burst_target_count else 'No safe burst targets available. Burst apply only includes other unreviewed, single-detection candidates in the same burst group.'}</div>
@@ -647,34 +790,36 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
             {suggestion_html}
             {stress_reason_html}
             <div style="margin: 10px 0 16px 0;">
-              {f'<a data-nav="prev" href="/review?id={html.escape(prev_candidate["id"])}"><button type="button">Previous Reviewed Candidate</button></a>' if prev_candidate else '<button type="button" disabled>Previous Reviewed Candidate</button>'}
+              {f'<a data-nav="prev" href="/review?scope={_q(scope["scope_key"])}&id={html.escape(prev_candidate["id"])}"><button type="button">(P) Previous Reviewed Candidate</button></a>' if prev_candidate else '<button type="button" disabled>(P) Previous Reviewed Candidate</button>'}
             </div>
             <form method="post" action="/review" data-role="review-form">
+              <input type="hidden" name="scope_key" value="{html.escape(scope['scope_key'])}">
               <input type="hidden" name="candidate_id" value="{html.escape(candidate['id'])}">
               <input type="hidden" name="action" value="{default_save_action}">
               <input id="selected-truth-label" type="hidden" name="selected_truth_label" value="{html.escape(prefill_selected_truth_label)}">
               <input type="text" name="label_input" placeholder="Type common name" value="{html.escape(prefill_label_input)}">
-              <label class="toggle"><input id="stress-toggle" type="checkbox" name="stress" value="1" {'checked' if prefill_stress else ''}> mark as stress</label>
-              <div class="small">Type a common name or use a recent label button below. Shortcuts: 0, 1-5, R, T, K, P, F. Label accepts default to burst apply when eligible.</div>
+              <label class="toggle"><input id="stress-toggle" type="checkbox" name="stress" value="1" {'checked' if prefill_stress else ''}> (T) mark as stress</label>
+              <div class="small">Type a common name or use a recent label button below. Shortcuts: 0, 1-5, R, T, K, N, P, F. Label accepts default to burst apply when eligible.</div>
               <div style="margin-top:10px">
                 <button class="primary" type="submit">{default_save_label}</button>
                 {f'<button type="submit" formaction="/review" formmethod="post" name="action" value="save">Save Current Only</button>' if burst_target_count else ''}
               </div>
             </form>
             <div class="recent" style="margin-top:14px">
-              <div><strong>Recent labels</strong></div>
+              <div><strong>Recent labels</strong> <span class="small">(1-5)</span></div>
               {''.join(recent_forms) or '<div class="small">No recent labels yet.</div>'}
             </div>
             <div class="actions" style="margin-top:16px">
               <div><strong>Other outcomes</strong></div>
-              {self._outcome_button(candidate['id'], 'reject', 'Reject')}
-              {self._outcome_button(candidate['id'], 'unsure', 'Unsure')}
-              {self._outcome_button(candidate['id'], 'not_a_bird', 'Not a Bird')}
-              {self._outcome_button(candidate['id'], 'bad_crop', 'Bad Crop')}
-              {self._outcome_button(candidate['id'], 'duplicate', 'Duplicate')}
-              {self._outcome_button(candidate['id'], 'skip', 'Skip')}
+              {self._outcome_button(scope['scope_key'], candidate['id'], 'reject', '(R) Reject')}
+              {self._outcome_button(scope['scope_key'], candidate['id'], 'unsure', 'Unsure')}
+              {self._outcome_button(scope['scope_key'], candidate['id'], 'not_a_bird', '(N) Not a Bird')}
+              {self._outcome_button(scope['scope_key'], candidate['id'], 'bad_crop', 'Bad Crop')}
+              {self._outcome_button(scope['scope_key'], candidate['id'], 'duplicate', 'Duplicate')}
+              {self._outcome_button(scope['scope_key'], candidate['id'], 'skip', '(K) Skip')}
             </div>
             <form method="post" action="/review" style="margin-top:16px">
+              <input type="hidden" name="scope_key" value="{html.escape(scope['scope_key'])}">
               <input type="hidden" name="candidate_id" value="{html.escape(candidate['id'])}">
               <input type="hidden" name="action" value="save">
               <input type="hidden" name="selected_truth_label" value="">
@@ -686,9 +831,10 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
         """
 
     @staticmethod
-    def _outcome_button(candidate_id: str, action: str, label: str) -> str:
+    def _outcome_button(scope_key: str, candidate_id: str, action: str, label: str) -> str:
         return f"""
         <form method="post" action="/review" data-action="{html.escape(action)}">
+          <input type="hidden" name="scope_key" value="{html.escape(scope_key)}">
           <input type="hidden" name="candidate_id" value="{html.escape(candidate_id)}">
           <input type="hidden" name="action" value="{html.escape(action)}">
           <button type="submit">{html.escape(label)}</button>
@@ -733,7 +879,7 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
         """
 
     @staticmethod
-    def _render_summary(summary: dict[str, Any], next_candidate_id: str | None, topup_status: dict[str, Any]) -> str:
+    def _render_summary(scope: dict[str, Any], summary: dict[str, Any], next_candidate_id: str | None, topup_status: dict[str, Any]) -> str:
         overview = summary["overview"]
         outcomes = summary["outcomes"]
         species = summary["species"]
@@ -766,7 +912,7 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
             for row in species
         )
         continue_button = (
-            f'<a href="/review?id={html.escape(next_candidate_id)}"><button class="primary" type="button">Resume Review</button></a>'
+            f'<a href="/review?scope={_q(scope["scope_key"])}&id={html.escape(next_candidate_id)}"><button class="primary" type="button">Resume Review</button></a>'
             if next_candidate_id
             else '<button class="primary" type="button" disabled>No Images Left To Review</button>'
         )
@@ -783,9 +929,11 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
           <div class="panel full">
             <div class="nav">
               {continue_button}
-              <a href="/summary"><button type="button">Refresh Summary</button></a>
+              <a href="/scopes"><button type="button">Switch Scope</button></a>
+              <a href="/summary?scope={_q(scope['scope_key'])}"><button type="button">Refresh Summary</button></a>
             </div>
             <h2>Review Summary</h2>
+            <div><strong>Scope:</strong> {html.escape(scope['scope_name'])}</div>
             <div class="small">Use this page to inspect progress at any time. It is also the default destination when no unreviewed candidates remain.</div>
             {topup_html}
           </div>
@@ -815,7 +963,7 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
         """
 
     @staticmethod
-    def _render_top_up_pending(status: dict[str, Any]) -> str:
+    def _render_top_up_pending(status: dict[str, Any], scope_key: str) -> str:
         return f"""
         <div class="wrap">
           <div class="panel full">
@@ -826,10 +974,10 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
               <div class="small">Images scanned in current top-up: {status['last_images_scanned']}</div>
               <div class="small">Candidates created in current top-up: {status['last_candidates_created']}</div>
             </div>
-            <p><a href="/summary"><button type="button">Open Summary</button></a></p>
+            <p><a href="/summary?scope={_q(scope_key)}"><button type="button">Open Summary</button></a></p>
             <script>
               setTimeout(function () {{
-                window.location = '/review';
+                window.location = '/review?scope={_q(scope_key)}';
               }}, 1500);
             </script>
           </div>
@@ -837,14 +985,48 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
         """
 
     @staticmethod
-    def _render_top_up_failed(error: str) -> str:
+    def _render_top_up_failed(error: str, scope_key: str) -> str:
         return (
             "<div class='wrap'><div class='panel full'>"
             "<h2>Automatic queue top-up failed</h2>"
             f"<p>{html.escape(str(error))}</p>"
-            "<p><a href=\"/summary\"><button type=\"button\">Go To Summary</button></a></p>"
+            f"<p><a href=\"/summary?scope={_q(scope_key)}\"><button type=\"button\">Go To Summary</button></a></p>"
             "</div></div>"
         )
+
+    @staticmethod
+    def _render_scopes(scopes: list[dict[str, Any]], topup_status: dict[str, Any]) -> str:
+        rows = "".join(
+            f"""
+            <tr>
+              <td><strong>{html.escape(scope['scope_name'])}</strong><div class="small">{html.escape(scope['catalog_path'])}</div></td>
+              <td>{html.escape(scope['trip_folder'])}</td>
+              <td>{scope.get('unreviewed_count') or 0}</td>
+              <td>{scope.get('reviewed_count') or 0}</td>
+              <td>{scope.get('candidate_count') or 0}</td>
+              <td><a href="/review?scope={_q(scope['scope_key'])}"><button type="button">Open</button></a></td>
+            </tr>
+            """
+            for scope in scopes
+        )
+        status = ""
+        if topup_status["running"]:
+            status = "<div class='resolved'><div><strong>Background extraction running</strong></div></div>"
+        return f"""
+        <div class="wrap">
+          <div class="panel full">
+            <h2>Review Scopes</h2>
+            <div class="small">Switch between persisted review scopes without restarting the app.</div>
+            {status}
+          </div>
+          <div class="panel full">
+            <table>
+              <thead><tr><th>Scope</th><th>Trip Folder</th><th>Unreviewed</th><th>Reviewed</th><th>Candidates</th><th></th></tr></thead>
+              <tbody>{rows or '<tr><td colspan="6" class="small">No scopes yet. If automatic top-up is configured, wait for the first batch to populate.</td></tr>'}</tbody>
+            </table>
+          </div>
+        </div>
+        """
 
     def _write_html(self, title: str, body: str) -> None:
         payload = _html_page(title, body)
@@ -891,6 +1073,7 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
         self,
         candidate_id: str,
         *,
+        scope_key: str,
         error: str = "",
         selected_truth_label: str = "",
         label_input: str = "",
@@ -901,6 +1084,7 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
         from urllib.parse import urlencode
 
         params = {
+            "scope": scope_key,
             "id": candidate_id,
             "error": error,
             "selected_truth_label": selected_truth_label,
@@ -913,6 +1097,16 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
         self.send_header("Location", f"/review?{urlencode(params)}")
         self.end_headers()
 
+    def _resolve_scope(self, scope_key: str | None) -> dict[str, Any] | None:
+        scopes = self.store.list_scopes()
+        if not scopes:
+            return None
+        if scope_key:
+            return self.store.get_scope(scope_key)
+        if len(scopes) == 1:
+            return scopes[0]
+        return None
+
     def log_message(self, format: str, *args) -> None:  # noqa: A003
         # Keep the server quiet unless there is an actual failure.
         return
@@ -922,6 +1116,12 @@ def _utc_now() -> str:
     from datetime import UTC, datetime
 
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _q(value: str) -> str:
+    from urllib.parse import quote_plus
+
+    return quote_plus(value)
 
 
 def parse_args() -> argparse.Namespace:
@@ -934,16 +1134,19 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8765)
+    p.add_argument("-v", "--verbose", action="store_true")
     p.add_argument("--catalog", help="Optional Lightroom catalog path for automatic queue top-up")
     p.add_argument("--detector", help="Import path for a detector class or factory")
+    p.add_argument("--detector-model", default=None, help="Optional detector model or weights path passed as model=...")
     p.add_argument("--preview-dir", help="Directory for generated preview JPEGs")
     p.add_argument("--batch-limit", type=int, default=100, help="Number of source images to scan per automatic top-up")
     p.add_argument("--folder", default=None, help="Optional folder filter for automatic top-up")
+    p.add_argument("--scope-folder", default=None, help="Optional scope folder override used for review-scope naming")
     p.add_argument("--min-stars", type=int, default=None, help="Optional minimum Lightroom rating for automatic top-up")
     p.add_argument(
         "--formats",
-        default="RAW,DNG,JPEG,TIFF",
-        help="Comma-separated Lightroom file formats to scan during automatic top-up",
+        default="RAW,DNG,JPEG,TIFF,PSD",
+        help="Comma-separated Lightroom file formats to scan during automatic top-up; accepts arbitrary Lightroom fileFormat values",
     )
     p.add_argument("--max-preview-dimension", type=int, default=2048)
     p.add_argument("--jpeg-quality", type=int, default=85)
@@ -962,7 +1165,23 @@ def main() -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%H:%M:%S",
+        force=True,
     )
+    if args.verbose:
+        for logger_name in (
+            __name__,
+            "src.catalog_extract",
+            "src.review_store",
+            "src.review_app",
+        ):
+            logging.getLogger(logger_name).setLevel(logging.DEBUG)
+        for logger_name in (
+            "PIL",
+            "PIL.TiffImagePlugin",
+            "exifread",
+            "ultralytics",
+        ):
+            logging.getLogger(logger_name).setLevel(logging.WARNING)
     labels = load_label_inventory(args.labels_file)
     if not labels:
         raise SystemExit("No labels loaded from labels file")
@@ -985,13 +1204,16 @@ def main() -> int:
         topup_runner = QueueTopUpRunner(
             catalog=args.catalog,
             detector_import_path=args.detector,
+            detector_model=args.detector_model,
             preview_dir=args.preview_dir,
             formats=formats,
             folder=args.folder,
+            scope_folder=args.scope_folder,
             min_stars=args.min_stars,
             batch_limit=args.batch_limit,
             max_preview_dimension=args.max_preview_dimension,
             jpeg_quality=args.jpeg_quality,
+            verbose=args.verbose,
         )
 
     class Handler(ReviewAppHandler):
@@ -1004,6 +1226,26 @@ def main() -> int:
     Handler.topup_runner = topup_runner
     Handler.topup_coordinator = topup_coordinator
     Handler.topup_low_watermark = args.topup_low_watermark
+
+    if topup_runner is not None:
+        scopes = store.list_scopes()
+        total_unreviewed = store.count_candidates(review_status="unreviewed")
+        only_legacy_scopes = bool(scopes) and all(scope["scope_key"] == "__legacy__" for scope in scopes)
+        needs_discovery = topup_runner.needs_scope_discovery(scopes)
+        if (
+            total_unreviewed <= args.topup_low_watermark
+            or only_legacy_scopes
+            or not scopes
+            or needs_discovery
+        ):
+            log.info(
+                "Startup triggered automatic discovery: total_unreviewed=%s watermark=%s only_legacy=%s needs_discovery=%s",
+                total_unreviewed,
+                args.topup_low_watermark,
+                only_legacy_scopes,
+                needs_discovery,
+            )
+            topup_coordinator.ensure_running(store, topup_runner, None)
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     try:

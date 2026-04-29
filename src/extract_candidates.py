@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import inspect
 import json
 import logging
 import sys
@@ -28,6 +29,16 @@ def _load_object(import_path: str):
     return getattr(module, attr_name)
 
 
+def _build_detector(detector_factory, *, model: str | None = None):
+    if model is None:
+        return detector_factory()
+    signature = inspect.signature(detector_factory)
+    accepts_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values())
+    if "model" in signature.parameters or accepts_kwargs:
+        return detector_factory(model=model)
+    raise TypeError("Selected detector does not accept a 'model' argument")
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Extract review candidates from a Lightroom catalog.")
     p.add_argument("--catalog", required=True, help="Path to the Lightroom .lrcat catalog")
@@ -38,8 +49,10 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Import path for a detector class or factory, e.g. package.module.Detector",
     )
+    p.add_argument("--detector-model", default=None, help="Optional detector model or weights path passed as model=...")
     p.add_argument("--limit", type=int, default=None, help="Limit the number of catalog images processed")
     p.add_argument("--folder", default=None, help="Optional folder filter passed through to catalog enumeration")
+    p.add_argument("--scope-folder", default=None, help="Optional scope folder override used for review-scope naming")
     p.add_argument("--min-stars", type=int, default=None, help="Optional minimum Lightroom rating")
     p.add_argument(
         "--rescan",
@@ -48,8 +61,8 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--formats",
-        default="RAW,DNG,JPEG,TIFF",
-        help="Comma-separated Lightroom file formats to scan (default excludes PSD/PSB)",
+        default="RAW,DNG,JPEG,TIFF,PSD",
+        help="Comma-separated Lightroom file formats to scan; accepts arbitrary Lightroom fileFormat values",
     )
     p.add_argument("--max-preview-dimension", type=int, default=2048)
     p.add_argument("--jpeg-quality", type=int, default=85)
@@ -61,12 +74,14 @@ def _scope_key(
     *,
     catalog: str,
     folder: str | None,
+    scope_folder: str | None,
     min_stars: int | None,
     formats: set[str],
 ) -> str:
     payload = {
         "catalog": str(Path(catalog).resolve()),
         "folder": folder or "",
+        "scope_folder": scope_folder or "",
         "min_stars": min_stars,
         "formats": sorted(formats),
     }
@@ -82,7 +97,7 @@ def main() -> int:
     )
 
     detector_factory = _load_object(args.detector)
-    detector = detector_factory()
+    detector = _build_detector(detector_factory, model=args.detector_model)
     provider = BoxedPreviewProvider(
         args.preview_dir,
         max_dimension=args.max_preview_dimension,
@@ -97,6 +112,7 @@ def main() -> int:
         scope_key = _scope_key(
             catalog=args.catalog,
             folder=args.folder,
+            scope_folder=args.scope_folder,
             min_stars=args.min_stars,
             formats=formats,
         )
@@ -141,6 +157,7 @@ def main() -> int:
             args.catalog,
             formats=formats,
             folder_filter=args.folder,
+            scope_folder_override=args.scope_folder,
             min_rating=args.min_stars,
             start_after_id=start_after_id,
             limit=args.limit,

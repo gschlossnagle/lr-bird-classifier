@@ -21,6 +21,14 @@ out gradually and verify results before committing to the whole archive.
 This project builds on the [birder-project/birder](https://github.com/birder-project/birder)
 library for the heavy lifting of bird classification.  Big thanks to Ofer Hasson.
 
+## Additional documentation
+
+- [Ground-Truth Evaluation Workflow](docs/GROUND_TRUTH_EVALUATION_WORKFLOW.md) — how to use the
+  review and export tooling to build a human-reviewed benchmark for comparing
+  model efficacy on your own catalog
+- [Project Notes](docs/PROJECT_NOTES.md) — ongoing project maintenance notes and
+  documentation expectations
+
 ## What it does
 
 For each untagged RAW/DNG (or TIFF, PSD, PSB) bird photo the script:

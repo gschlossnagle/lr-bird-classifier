@@ -14,6 +14,7 @@ from .review_store import ReviewStore
 class QueueFilters:
     """Subset of filters needed for v1 queue navigation."""
 
+    scope_key: str | None = None
     review_status: str | None = "unreviewed"
     burst_group_id: str | None = None
 
@@ -27,6 +28,7 @@ class ReviewQueue:
 
     def list_candidates(self) -> list[dict[str, Any]]:
         return self.store.list_candidates(
+            scope_key=self.filters.scope_key,
             review_status=self.filters.review_status,
             burst_group_id=self.filters.burst_group_id,
         )

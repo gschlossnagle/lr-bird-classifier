@@ -8,6 +8,9 @@ or preview-generation strategy.
 
 from __future__ import annotations
 
+import json
+import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +26,8 @@ except ImportError:  # pragma: no cover - fallback path exercised in tests via p
 from .catalog import CatalogImage, LightroomCatalog
 from .raw_utils import load_image
 from .review_store import ReviewStore
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -90,10 +95,12 @@ class CatalogExtractor:
         *,
         formats: set[str] | None = None,
         folder_filter: str | None = None,
+        scope_folder_override: str | None = None,
         min_rating: int | None = None,
         start_after_id: int | None = None,
         limit: int | None = None,
         created_at: str,
+        verbose: bool = False,
     ) -> tuple[int, int, int | None]:
         """
         Scan catalog images, run the detector, and populate the review store.
@@ -114,48 +121,65 @@ class CatalogExtractor:
             )
             sequence_metadata = self._load_sequence_metadata(images)
             burst_groups = self._assign_burst_groups(images, sequence_metadata)
+            scan_log = log.info if verbose else log.debug
             for image in images:
                 image_path = Path(image.file_path)
-                image_id = self._insert_image(image, created_at, burst_groups.get(image.id_local))
+                scan_log("Scanning source image %s", image_path)
+                scope = self._derive_scope(
+                    catalog_path,
+                    image_path,
+                    created_at,
+                    scope_folder_override=scope_folder_override,
+                )
+                image_id = self._insert_image(image, created_at, burst_groups.get(image.id_local), scope["scope_key"])
                 images_inserted += 1
                 last_image_id_processed = image.id_local
                 loaded_image = None
                 working_image = None
                 source_size: tuple[int, int] | None = None
-                if hasattr(self.detector, "detect_image") or hasattr(self.preview_provider, "build_preview_from_image"):
-                    loaded_image = load_image(image_path)
-                    source_size = loaded_image.size
-                    working_image = _make_working_image(
-                        loaded_image,
-                        max_dimension=_working_max_dimension(self.detector, self.preview_provider),
-                    )
-                if working_image is not None and hasattr(self.detector, "detect_image"):
-                    detections = self.detector.detect_image(working_image, image_path)
-                    if source_size is not None and working_image.size != source_size:
-                        detections = _rescale_detections(
-                            detections,
-                            from_size=working_image.size,
-                            to_size=source_size,
+                try:
+                    if hasattr(self.detector, "detect_image") or hasattr(self.preview_provider, "build_preview_from_image"):
+                        loaded_image = load_image(image_path)
+                        source_size = loaded_image.size
+                        working_image = _make_working_image(
+                            loaded_image,
+                            max_dimension=_working_max_dimension(self.detector, self.preview_provider),
                         )
-                else:
-                    detections = self.detector.detect(image_path)
+                    if working_image is not None and hasattr(self.detector, "detect_image"):
+                        detections = self.detector.detect_image(working_image, image_path)
+                        if source_size is not None and working_image.size != source_size:
+                            detections = _rescale_detections(
+                                detections,
+                                from_size=working_image.size,
+                                to_size=source_size,
+                            )
+                    else:
+                        detections = self.detector.detect(image_path)
+                    scan_log("Detector found %s candidate(s) for %s", len(detections), image_path)
+                except Exception as exc:
+                    log.warning("Skipping unreadable or unprocessable image %s: %s", image_path, exc)
+                    continue
                 burst_safe_flags = self._burst_safe_detection_flags(detections)
                 for idx, detection in enumerate(detections, start=1):
                     candidate_id = f"img{image.id_local}_det{idx:03d}"
-                    if working_image is not None and hasattr(self.preview_provider, "build_preview_from_image"):
-                        preview_path = self.preview_provider.build_preview_from_image(
-                            working_image,
-                            image_path,
-                            detection,
-                            candidate_id,
-                            source_size=source_size,
-                        )
-                    else:
-                        preview_path = self.preview_provider.build_preview(
-                            image_path,
-                            detection,
-                            candidate_id,
-                        )
+                    try:
+                        if working_image is not None and hasattr(self.preview_provider, "build_preview_from_image"):
+                            preview_path = self.preview_provider.build_preview_from_image(
+                                working_image,
+                                image_path,
+                                detection,
+                                candidate_id,
+                                source_size=source_size,
+                            )
+                        else:
+                            preview_path = self.preview_provider.build_preview(
+                                image_path,
+                                detection,
+                                candidate_id,
+                            )
+                    except Exception as exc:
+                        log.warning("Skipping preview generation for %s candidate %s: %s", image_path, candidate_id, exc)
+                        continue
                     inserted = self.store.insert_candidate(
                         {
                             "candidate_id": candidate_id,
@@ -178,9 +202,16 @@ class CatalogExtractor:
                         candidates_inserted += 1
         return images_inserted, candidates_inserted, last_image_id_processed
 
-    def _insert_image(self, image: CatalogImage, created_at: str, burst_group_id: str | None) -> int:
+    def _insert_image(
+        self,
+        image: CatalogImage,
+        created_at: str,
+        burst_group_id: str | None,
+        scope_key: str,
+    ) -> int:
         return self.store.insert_image(
             {
+                "scope_key": scope_key,
                 "source_image_id": image.id_local,
                 "source_image_path": str(Path(image.file_path).resolve()),
                 "capture_datetime": image.capture_time,
@@ -190,6 +221,43 @@ class CatalogExtractor:
                 "created_at": created_at,
             }
         )
+
+    def _derive_scope(
+        self,
+        catalog_path: str | Path,
+        image_path: Path,
+        created_at: str,
+        *,
+        scope_folder_override: str | None = None,
+    ) -> dict[str, str]:
+        resolved_catalog_path = str(Path(catalog_path).resolve())
+        catalog_name = Path(resolved_catalog_path).stem
+        trip_folder = scope_folder_override or _derive_trip_folder(image_path)
+        scope_key = json.dumps(
+            {
+                "catalog_path": resolved_catalog_path,
+                "catalog_name": catalog_name,
+                "trip_folder": trip_folder,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        scope_name = f"{catalog_name} / {trip_folder}"
+        self.store.ensure_scope(
+            scope_key=scope_key,
+            scope_name=scope_name,
+            catalog_name=catalog_name,
+            catalog_path=resolved_catalog_path,
+            trip_folder=trip_folder,
+            created_at=created_at,
+        )
+        return {
+            "scope_key": scope_key,
+            "scope_name": scope_name,
+            "catalog_name": catalog_name,
+            "catalog_path": resolved_catalog_path,
+            "trip_folder": trip_folder,
+        }
 
     @staticmethod
     def _burst_safe_detection_flags(detections: list[Detection]) -> list[bool]:
@@ -472,3 +540,33 @@ def _rescale_detections(
             )
         )
     return scaled
+
+
+_YEAR_DIR_RE = re.compile(r"^\d{4}$")
+_DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _derive_trip_folder(image_path: Path) -> str:
+    resolved = image_path.resolve()
+    parts = resolved.parts[:-1]
+
+    # Preferred heuristic:
+    # find a year directory, then take the first directory under that year
+    # whose immediate child is a date-like folder.
+    for idx, part in enumerate(parts[:-2]):
+        if not _YEAR_DIR_RE.match(part):
+            continue
+        candidate = parts[idx + 1]
+        date_child = parts[idx + 2]
+        if not _DATE_DIR_RE.match(date_child):
+            continue
+        if _DATE_DIR_RE.match(candidate):
+            continue
+        return str(Path(*parts[: idx + 2]))
+
+    # Fallback: nearest non-date ancestor above a date-like folder.
+    for idx, part in enumerate(parts):
+        if _DATE_DIR_RE.match(part) and idx > 0:
+            return str(Path(*parts[:idx]))
+
+    return str(resolved.parent)

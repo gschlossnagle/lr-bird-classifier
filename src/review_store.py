@@ -12,7 +12,7 @@ from typing import Any
 
 from .review_validation import validate_annotation_row, validate_candidate_row
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class ReviewStore:
@@ -46,10 +46,23 @@ class ReviewStore:
     def _create_schema(self) -> None:
         self._conn.executescript(
             """
+            CREATE TABLE review_scopes (
+                scope_key    TEXT PRIMARY KEY,
+                scope_name   TEXT NOT NULL,
+                catalog_name TEXT NOT NULL,
+                catalog_path TEXT NOT NULL,
+                trip_folder  TEXT NOT NULL,
+                created_at   TEXT NOT NULL,
+                last_opened_at TEXT,
+                status       TEXT NOT NULL DEFAULT 'active',
+                notes        TEXT
+            );
+
             CREATE TABLE images (
                 id                   INTEGER PRIMARY KEY,
+                scope_key            TEXT NOT NULL,
                 source_image_id      INTEGER,
-                source_image_path    TEXT NOT NULL UNIQUE,
+                source_image_path    TEXT NOT NULL,
                 capture_datetime     TEXT,
                 folder               TEXT,
                 rating               REAL,
@@ -61,7 +74,9 @@ class ReviewStore:
                 existing_keywords    TEXT,
                 burst_group_id       TEXT,
                 near_duplicate_group TEXT,
-                created_at           TEXT NOT NULL
+                created_at           TEXT NOT NULL,
+                FOREIGN KEY (scope_key) REFERENCES review_scopes(scope_key),
+                UNIQUE (scope_key, source_image_path)
             );
 
             CREATE TABLE candidates (
@@ -138,6 +153,9 @@ class ReviewStore:
                 updated_at     TEXT NOT NULL
             );
 
+            CREATE INDEX idx_scopes_last_opened_at ON review_scopes (last_opened_at);
+
+            CREATE INDEX idx_images_scope_key         ON images (scope_key);
             CREATE INDEX idx_images_capture_datetime ON images (capture_datetime);
             CREATE INDEX idx_images_burst_group_id   ON images (burst_group_id);
             CREATE INDEX idx_images_region_hint      ON images (region_hint);
@@ -169,6 +187,75 @@ class ReviewStore:
             )
             current_version = 2
 
+        if current_version == 2:
+            self._conn.execute("PRAGMA foreign_keys = OFF")
+            try:
+                self._conn.executescript(
+                    """
+                    CREATE TABLE review_scopes (
+                        scope_key    TEXT PRIMARY KEY,
+                        scope_name   TEXT NOT NULL,
+                        catalog_name TEXT NOT NULL,
+                        catalog_path TEXT NOT NULL,
+                        trip_folder  TEXT NOT NULL,
+                        created_at   TEXT NOT NULL,
+                        last_opened_at TEXT,
+                        status       TEXT NOT NULL DEFAULT 'active',
+                        notes        TEXT
+                    );
+
+                    INSERT INTO review_scopes (
+                        scope_key, scope_name, catalog_name, catalog_path, trip_folder, created_at, status
+                    ) VALUES (
+                        '__legacy__', 'Legacy Imported Scope', 'Legacy', 'Legacy', 'Legacy', '1970-01-01T00:00:00Z', 'active'
+                    );
+
+                    CREATE TABLE images_new (
+                        id                   INTEGER PRIMARY KEY,
+                        scope_key            TEXT NOT NULL,
+                        source_image_id      INTEGER,
+                        source_image_path    TEXT NOT NULL,
+                        capture_datetime     TEXT,
+                        folder               TEXT,
+                        rating               REAL,
+                        gps_lat              REAL,
+                        gps_lon              REAL,
+                        region_hint          TEXT,
+                        lens_model           TEXT,
+                        focal_length         REAL,
+                        existing_keywords    TEXT,
+                        burst_group_id       TEXT,
+                        near_duplicate_group TEXT,
+                        created_at           TEXT NOT NULL,
+                        FOREIGN KEY (scope_key) REFERENCES review_scopes(scope_key),
+                        UNIQUE (scope_key, source_image_path)
+                    );
+
+                    INSERT INTO images_new (
+                        id, scope_key, source_image_id, source_image_path, capture_datetime, folder,
+                        rating, gps_lat, gps_lon, region_hint, lens_model, focal_length,
+                        existing_keywords, burst_group_id, near_duplicate_group, created_at
+                    )
+                    SELECT
+                        id, '__legacy__', source_image_id, source_image_path, capture_datetime, folder,
+                        rating, gps_lat, gps_lon, region_hint, lens_model, focal_length,
+                        existing_keywords, burst_group_id, near_duplicate_group, created_at
+                    FROM images;
+
+                    DROP TABLE images;
+                    ALTER TABLE images_new RENAME TO images;
+
+                    CREATE INDEX idx_scopes_last_opened_at ON review_scopes (last_opened_at);
+                    CREATE INDEX idx_images_scope_key         ON images (scope_key);
+                    CREATE INDEX idx_images_capture_datetime ON images (capture_datetime);
+                    CREATE INDEX idx_images_burst_group_id   ON images (burst_group_id);
+                    CREATE INDEX idx_images_region_hint      ON images (region_hint);
+                    """
+                )
+            finally:
+                self._conn.execute("PRAGMA foreign_keys = ON")
+            current_version = 3
+
         if current_version != SCHEMA_VERSION:
             raise RuntimeError(
                 f"Unsupported review store schema version {current_version}; "
@@ -185,16 +272,89 @@ class ReviewStore:
     def __exit__(self, *_) -> None:
         self.close()
 
+    def ensure_scope(
+        self,
+        *,
+        scope_key: str,
+        scope_name: str,
+        catalog_name: str,
+        catalog_path: str,
+        trip_folder: str,
+        created_at: str,
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO review_scopes (
+                    scope_key, scope_name, catalog_name, catalog_path, trip_folder, created_at, status
+                ) VALUES (?, ?, ?, ?, ?, ?, 'active')
+                ON CONFLICT(scope_key) DO UPDATE SET
+                    scope_name = excluded.scope_name,
+                    catalog_name = excluded.catalog_name,
+                    catalog_path = excluded.catalog_path,
+                    trip_folder = excluded.trip_folder
+                """,
+                (scope_key, scope_name, catalog_name, catalog_path, trip_folder, created_at),
+            )
+            self._conn.commit()
+
+    def touch_scope(self, scope_key: str, opened_at: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE review_scopes SET last_opened_at = ? WHERE scope_key = ?",
+                (opened_at, scope_key),
+            )
+            self._conn.commit()
+
+    def list_scopes(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT
+                    s.*,
+                    COUNT(DISTINCT i.id) AS image_count,
+                    COUNT(DISTINCT c.id) AS candidate_count,
+                    COUNT(DISTINCT CASE WHEN c.review_status = 'unreviewed' THEN c.image_id END) AS unreviewed_image_count,
+                    SUM(CASE WHEN c.review_status = 'unreviewed' THEN 1 ELSE 0 END) AS unreviewed_count,
+                    SUM(CASE WHEN c.review_status = 'reviewed' THEN 1 ELSE 0 END) AS reviewed_count
+                FROM review_scopes s
+                LEFT JOIN images i ON i.scope_key = s.scope_key
+                LEFT JOIN candidates c ON c.image_id = i.id
+                GROUP BY s.scope_key, s.scope_name, s.catalog_name, s.catalog_path, s.trip_folder,
+                         s.created_at, s.last_opened_at, s.status, s.notes
+                ORDER BY COALESCE(s.last_opened_at, s.created_at) DESC, s.scope_name ASC
+                """
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_scope(self, scope_key: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM review_scopes WHERE scope_key = ?",
+                (scope_key,),
+            ).fetchone()
+            return dict(row) if row else None
+
     def insert_image(self, row: dict[str, Any]) -> int:
         payload = dict(row)
+        if not payload.get("scope_key"):
+            payload["scope_key"] = "__default__"
+            self.ensure_scope(
+                scope_key="__default__",
+                scope_name="Default Scope",
+                catalog_name="Default",
+                catalog_path="Default",
+                trip_folder="Default",
+                created_at=payload.get("created_at", "1970-01-01T00:00:00Z"),
+            )
         existing_keywords = payload.get("existing_keywords")
         if existing_keywords is not None and not isinstance(existing_keywords, str):
             payload["existing_keywords"] = json.dumps(existing_keywords)
 
         with self._lock:
             existing = self._conn.execute(
-                "SELECT id FROM images WHERE source_image_path = ?",
-                (payload["source_image_path"],),
+                "SELECT id FROM images WHERE scope_key = ? AND source_image_path = ?",
+                (payload["scope_key"], payload["source_image_path"]),
             ).fetchone()
             if existing is not None:
                 return int(existing["id"])
@@ -202,13 +362,14 @@ class ReviewStore:
             cur = self._conn.execute(
                 """
                 INSERT INTO images (
-                    source_image_id, source_image_path, capture_datetime, folder,
+                    scope_key, source_image_id, source_image_path, capture_datetime, folder,
                     rating, gps_lat, gps_lon, region_hint, lens_model,
                     focal_length, existing_keywords, burst_group_id,
                     near_duplicate_group, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    payload["scope_key"],
                     payload.get("source_image_id"),
                     payload["source_image_path"],
                     payload.get("capture_datetime"),
@@ -319,7 +480,7 @@ class ReviewStore:
             self._conn.execute("DELETE FROM extraction_cursors WHERE scope_key = ?", (scope_key,))
             self._conn.commit()
 
-    def delete_images_by_source_paths(self, source_paths: list[str]) -> int:
+    def delete_images_by_source_paths(self, source_paths: list[str], *, scope_key: str | None = None) -> int:
         """
         Delete extracted review rows for the given source image paths.
 
@@ -333,10 +494,12 @@ class ReviewStore:
             for i in range(0, len(source_paths), 500):
                 chunk = source_paths[i : i + 500]
                 placeholders = ",".join("?" * len(chunk))
-                image_rows = self._conn.execute(
-                    f"SELECT id FROM images WHERE source_image_path IN ({placeholders})",
-                    chunk,
-                ).fetchall()
+                sql = f"SELECT id FROM images WHERE source_image_path IN ({placeholders})"
+                params: list[Any] = list(chunk)
+                if scope_key is not None:
+                    sql += " AND scope_key = ?"
+                    params.append(scope_key)
+                image_rows = self._conn.execute(sql, params).fetchall()
                 image_ids = [int(row["id"]) for row in image_rows]
                 if not image_ids:
                     continue
@@ -463,6 +626,7 @@ class ReviewStore:
     def list_candidates(
         self,
         *,
+        scope_key: str | None = None,
         review_status: str | None = None,
         burst_group_id: str | None = None,
         limit: int | None = None,
@@ -474,6 +638,9 @@ class ReviewStore:
             WHERE 1 = 1
         """
         params: list[Any] = []
+        if scope_key is not None:
+            sql += " AND i.scope_key = ?"
+            params.append(scope_key)
         if review_status is not None:
             sql += " AND c.review_status = ?"
             params.append(review_status)
@@ -491,6 +658,7 @@ class ReviewStore:
     def count_candidates(
         self,
         *,
+        scope_key: str | None = None,
         review_status: str | None = None,
         burst_group_id: str | None = None,
     ) -> int:
@@ -501,6 +669,9 @@ class ReviewStore:
             WHERE 1 = 1
         """
         params: list[Any] = []
+        if scope_key is not None:
+            sql += " AND i.scope_key = ?"
+            params.append(scope_key)
         if review_status is not None:
             sql += " AND c.review_status = ?"
             params.append(review_status)
@@ -514,14 +685,19 @@ class ReviewStore:
     def count_candidate_images(
         self,
         *,
+        scope_key: str | None = None,
         review_status: str | None = None,
     ) -> int:
         sql = """
             SELECT COUNT(DISTINCT c.image_id) AS n
             FROM candidates c
+            JOIN images i ON i.id = c.image_id
             WHERE 1 = 1
         """
         params: list[Any] = []
+        if scope_key is not None:
+            sql += " AND i.scope_key = ?"
+            params.append(scope_key)
         if review_status is not None:
             sql += " AND c.review_status = ?"
             params.append(review_status)
@@ -533,19 +709,22 @@ class ReviewStore:
         self,
         candidate_id: str,
         *,
+        scope_key: str | None = None,
         review_status: str = "unreviewed",
     ) -> tuple[int, int] | None:
         with self._lock:
-            rows = self._conn.execute(
-                """
+            sql = """
                 SELECT c.id
                 FROM candidates c
                 JOIN images i ON i.id = c.image_id
                 WHERE c.review_status = ?
-                ORDER BY julianday(i.capture_datetime) ASC, i.capture_datetime ASC, c.id ASC
-                """,
-                (review_status,),
-            ).fetchall()
+            """
+            params: list[Any] = [review_status]
+            if scope_key is not None:
+                sql += " AND i.scope_key = ?"
+                params.append(scope_key)
+            sql += " ORDER BY julianday(i.capture_datetime) ASC, i.capture_datetime ASC, c.id ASC"
+            rows = self._conn.execute(sql, params).fetchall()
             ordered_ids = [row["id"] for row in rows]
             if candidate_id not in ordered_ids:
                 return None
@@ -587,11 +766,11 @@ class ReviewStore:
                     break
             return unique
 
-    def previous_reviewed_candidate(self, current_candidate_id: str) -> dict[str, Any] | None:
+    def previous_reviewed_candidate(self, current_candidate_id: str, *, scope_key: str | None = None) -> dict[str, Any] | None:
         with self._lock:
             current = self._conn.execute(
                 """
-                SELECT i.capture_datetime AS capture_datetime, c.id AS id
+                SELECT i.capture_datetime AS capture_datetime, c.id AS id, i.scope_key AS scope_key
                 FROM candidates c
                 JOIN images i ON i.id = c.image_id
                 WHERE c.id = ?
@@ -606,6 +785,7 @@ class ReviewStore:
                 FROM candidates c
                 JOIN images i ON i.id = c.image_id
                 WHERE c.review_status = 'reviewed'
+                  AND i.scope_key = ?
                   AND (
                     julianday(i.capture_datetime) < julianday(?)
                     OR (
@@ -616,7 +796,7 @@ class ReviewStore:
                 ORDER BY julianday(i.capture_datetime) DESC, i.capture_datetime DESC, c.id DESC
                 LIMIT 1
                 """,
-                (current["capture_datetime"], current["capture_datetime"], current["id"]),
+                (scope_key or current["scope_key"], current["capture_datetime"], current["capture_datetime"], current["id"]),
             ).fetchone()
             return dict(row) if row else None
 
@@ -629,7 +809,7 @@ class ReviewStore:
         with self._lock:
             current = self._conn.execute(
                 """
-                SELECT c.id AS id, i.burst_group_id AS burst_group_id, i.capture_datetime AS capture_datetime
+                SELECT c.id AS id, i.burst_group_id AS burst_group_id, i.capture_datetime AS capture_datetime, i.scope_key AS scope_key
                 FROM candidates c
                 JOIN images i ON i.id = c.image_id
                 WHERE c.id = ?
@@ -644,10 +824,11 @@ class ReviewStore:
                 FROM candidates c
                 JOIN images i ON i.id = c.image_id
                 WHERE i.burst_group_id = ?
+                  AND i.scope_key = ?
                   AND c.id != ?
                   AND c.safe_single_subject_burst = 1
             """
-            params: list[Any] = [current["burst_group_id"], candidate_id]
+            params: list[Any] = [current["burst_group_id"], current["scope_key"], candidate_id]
             if not include_reviewed:
                 sql += " AND c.review_status != 'reviewed'"
             sql += " ORDER BY julianday(i.capture_datetime) ASC, i.capture_datetime ASC, c.id ASC"
@@ -658,7 +839,7 @@ class ReviewStore:
         with self._lock:
             current = self._conn.execute(
                 """
-                SELECT i.burst_group_id AS burst_group_id, i.capture_datetime AS capture_datetime, c.id AS id
+                SELECT i.burst_group_id AS burst_group_id, i.capture_datetime AS capture_datetime, c.id AS id, i.scope_key AS scope_key
                 FROM candidates c
                 JOIN images i ON i.id = c.image_id
                 WHERE c.id = ?
@@ -674,9 +855,10 @@ class ReviewStore:
                 FROM candidates c
                 JOIN images i ON i.id = c.image_id
                 WHERE i.burst_group_id = ?
+                  AND i.scope_key = ?
                 ORDER BY julianday(i.capture_datetime) ASC, i.capture_datetime ASC, c.id ASC
                 """,
-                (current["burst_group_id"],),
+                (current["burst_group_id"], current["scope_key"]),
             ).fetchall()
             ordered_ids = [row["id"] for row in rows]
             if candidate_id not in ordered_ids:
@@ -697,41 +879,60 @@ class ReviewStore:
             count += 1
         return count
 
-    def summary_counts(self) -> dict[str, Any]:
+    def summary_counts(self, *, scope_key: str | None = None) -> dict[str, Any]:
         with self._lock:
+            overview_sql = """
+                SELECT c.review_status, COUNT(*) AS n
+                FROM candidates c
+                JOIN images i ON i.id = c.image_id
+            """
+            overview_params: list[Any] = []
+            if scope_key is not None:
+                overview_sql += " WHERE i.scope_key = ?"
+                overview_params.append(scope_key)
+            overview_sql += " GROUP BY c.review_status"
             overview_rows = self._conn.execute(
-                """
-                SELECT review_status, COUNT(*) AS n
-                FROM candidates
-                GROUP BY review_status
-                """
+                overview_sql,
+                overview_params,
             ).fetchall()
             overview = {row["review_status"]: int(row["n"]) for row in overview_rows}
 
-            outcome_rows = self._conn.execute(
-                """
-                SELECT annotation_status, COUNT(*) AS n
-                FROM annotations
-                GROUP BY annotation_status
-                """
-            ).fetchall()
+            outcome_sql = """
+                SELECT a.annotation_status, COUNT(*) AS n
+                FROM annotations a
+                JOIN candidates c ON c.id = a.candidate_id
+                JOIN images i ON i.id = c.image_id
+            """
+            outcome_params: list[Any] = []
+            if scope_key is not None:
+                outcome_sql += " WHERE i.scope_key = ?"
+                outcome_params.append(scope_key)
+            outcome_sql += " GROUP BY a.annotation_status"
+            outcome_rows = self._conn.execute(outcome_sql, outcome_params).fetchall()
             outcomes = {row["annotation_status"]: int(row["n"]) for row in outcome_rows}
 
-            species_rows = self._conn.execute(
-                """
+            species_sql = """
                 SELECT
-                    truth_common_name,
-                    truth_sci_name,
-                    truth_label,
-                    SUM(CASE WHEN stress = 0 THEN 1 ELSE 0 END) AS normal_count,
-                    SUM(CASE WHEN stress = 1 THEN 1 ELSE 0 END) AS stress_count,
+                    a.truth_common_name,
+                    a.truth_sci_name,
+                    a.truth_label,
+                    SUM(CASE WHEN a.stress = 0 THEN 1 ELSE 0 END) AS normal_count,
+                    SUM(CASE WHEN a.stress = 1 THEN 1 ELSE 0 END) AS stress_count,
                     COUNT(*) AS total_count
-                FROM annotations
-                WHERE annotation_status = 'labeled'
-                GROUP BY truth_label, truth_common_name, truth_sci_name
+                FROM annotations a
+                JOIN candidates c ON c.id = a.candidate_id
+                JOIN images i ON i.id = c.image_id
+                WHERE a.annotation_status = 'labeled'
+            """
+            species_params: list[Any] = []
+            if scope_key is not None:
+                species_sql += " AND i.scope_key = ?"
+                species_params.append(scope_key)
+            species_sql += """
+                GROUP BY a.truth_label, a.truth_common_name, a.truth_sci_name
                 ORDER BY total_count DESC, truth_common_name ASC
-                """
-            ).fetchall()
+            """
+            species_rows = self._conn.execute(species_sql, species_params).fetchall()
             species = [dict(row) for row in species_rows]
             return {
                 "overview": overview,

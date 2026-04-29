@@ -101,6 +101,60 @@ class ReviewStoreTest(unittest.TestCase):
         )
         self.assertEqual(same_id, self.image_id)
 
+    def test_scope_filtered_counts_are_isolated(self) -> None:
+        self.store.ensure_scope(
+            scope_key="scope_b",
+            scope_name="Catalog / Trip B",
+            catalog_name="Catalog",
+            catalog_path="/tmp/catalog.lrcat",
+            trip_folder="Trip B",
+            created_at="2026-04-22T17:00:00Z",
+        )
+        image_b = self.store.insert_image(
+            {
+                "scope_key": "scope_b",
+                "source_image_id": 999,
+                "source_image_path": str((self.tmpdir / "source_b.ARW").resolve()),
+                "capture_datetime": "2026-04-23T17:00:00Z",
+                "folder": str(self.tmpdir.resolve()),
+                "created_at": "2026-04-23T17:00:00Z",
+            }
+        )
+        self.store.insert_candidate(
+            {
+                "candidate_id": "cand_scope_a",
+                "image_id": self.image_id,
+                "detector_name": "yolo-bird-v1",
+                "detected_class": "bird",
+                "detector_confidence": 0.93,
+                "bbox_x1": 10,
+                "bbox_y1": 20,
+                "bbox_x2": 110,
+                "bbox_y2": 220,
+                "preview_image_path": str(self.preview_path.resolve()),
+                "review_status": "unreviewed",
+                "created_at": "2026-04-22T17:01:00Z",
+            }
+        )
+        self.store.insert_candidate(
+            {
+                "candidate_id": "cand_scope_b",
+                "image_id": image_b,
+                "detector_name": "yolo-bird-v1",
+                "detected_class": "bird",
+                "detector_confidence": 0.93,
+                "bbox_x1": 10,
+                "bbox_y1": 20,
+                "bbox_x2": 110,
+                "bbox_y2": 220,
+                "preview_image_path": str(self.preview_path.resolve()),
+                "review_status": "unreviewed",
+                "created_at": "2026-04-23T17:01:00Z",
+            }
+        )
+        self.assertEqual(self.store.count_candidates(scope_key="__default__", review_status="unreviewed"), 1)
+        self.assertEqual(self.store.count_candidates(scope_key="scope_b", review_status="unreviewed"), 1)
+
     def test_delete_images_by_source_paths_removes_related_rows(self) -> None:
         self.store.insert_candidate(
             {
