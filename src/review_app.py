@@ -1080,6 +1080,7 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
                     candidate["bbox_x2"],
                     candidate["bbox_y2"],
                 ),
+                catalog_path=scope.get("catalog_path"),
             )
         except Exception:
             return None

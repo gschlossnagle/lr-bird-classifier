@@ -47,6 +47,11 @@ At a high level, the workflow is:
 The review UI is local-first. It is designed to run on a machine that can see
 the original photo files and the Lightroom catalog.
 
+When Lightroom standard previews are available, the extraction/review workflow
+now prefers them over decoding the source RAW. This speeds up candidate
+extraction substantially while keeping the original source files as a fallback
+when previews are missing.
+
 When source EXIF supports it, the review UI may also show an `Estimated subject
 box size` readout. This is a rough real-world size estimate derived from focus
 distance, 35mm-equivalent focal length, and the detector box geometry. It is a

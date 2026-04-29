@@ -24,6 +24,7 @@ except ImportError:  # pragma: no cover - fallback path exercised in tests via p
     pyexiv2 = None
 
 from .catalog import CatalogImage, LightroomCatalog
+from .lightroom_preview import load_standard_preview
 from .raw_utils import load_image
 from .review_store import ReviewStore
 
@@ -139,7 +140,10 @@ class CatalogExtractor:
                 source_size: tuple[int, int] | None = None
                 try:
                     if hasattr(self.detector, "detect_image") or hasattr(self.preview_provider, "build_preview_from_image"):
-                        loaded_image = load_image(image_path)
+                        loaded_image = _load_working_source_image(
+                            catalog_path,
+                            image_path,
+                        )
                         source_size = loaded_image.size
                         working_image = _make_working_image(
                             loaded_image,
@@ -499,6 +503,13 @@ def _working_max_dimension(detector: BirdDetector, preview_provider: PreviewProv
     detector_imgsz = int(getattr(detector, "imgsz", 1024))
     preview_max_dimension = int(getattr(preview_provider, "max_dimension", detector_imgsz))
     return min(detector_imgsz, preview_max_dimension)
+
+
+def _load_working_source_image(catalog_path: str | Path, image_path: Path) -> Image.Image:
+    standard_preview = load_standard_preview(catalog_path, image_path)
+    if standard_preview is not None:
+        return standard_preview
+    return load_image(image_path)
 
 
 def _make_working_image(image: Image.Image, max_dimension: int) -> Image.Image:

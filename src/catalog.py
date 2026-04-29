@@ -76,6 +76,7 @@ class CatalogImage:
     rating: Optional[float]
     color_label: Optional[str]
     capture_time: Optional[str]
+    file_uuid: Optional[str] = None
 
 
 class LightroomCatalog:
@@ -173,6 +174,7 @@ class LightroomCatalog:
                 i.captureTime,
                 fi.baseName,
                 fi.extension,
+                fi.id_global,
                 rf.absolutePath,
                 fo.pathFromRoot
             FROM Adobe_images i
@@ -228,6 +230,7 @@ class LightroomCatalog:
                 rating=r["rating"],
                 color_label=r["colorLabels"],
                 capture_time=r["captureTime"],
+                file_uuid=r["id_global"],
             ))
 
         return images
