@@ -92,6 +92,8 @@ Rules:
 - must not write to Lightroom directly
 - should support the new regular-user workflow by reusing the same core review
   mechanics with minimal UI branching
+- must support workflow-specific action sets so the regular-user review-run
+  experience is simpler than the expert annotation workflow
 
 ### `src.apply_review_labels`
 
@@ -219,7 +221,8 @@ Purpose:
 
 - allow the DB to hold both expert detector-review scopes and regular-user
   review-run scopes
-- enable minimal workflow-aware rendering or behavior when necessary
+- enable workflow-aware rendering and action behavior where the workflows
+  legitimately differ
 
 ### Seeded Classifier Suggestions
 
@@ -260,6 +263,73 @@ Reason:
   benchmark oriented
 - one image should not require multiple pseudo-review passes unless there is a
   real design reason
+
+### Workflow-Specific Review Actions
+
+The review UI must not expose the same action surface for both workflows.
+
+#### `detector_review`
+
+This remains the expert-oriented annotation workflow.
+
+Allowed actions:
+
+- save label
+- save label and apply to burst when eligible
+- mark stress
+- reject
+- unsure
+- not a bird
+- bad crop
+- duplicate
+- skip
+
+Reason:
+
+- these outcomes are meaningful for benchmark construction and truth-set curation
+
+#### `run_hybrid_review`
+
+This is the regular-user catalog-tagging workflow.
+
+Allowed actions:
+
+- save label
+- skip
+
+Disallowed actions:
+
+- stress
+- reject
+- unsure
+- not a bird
+- bad crop
+- duplicate
+- burst-apply defaults unless deliberately introduced later for this workflow
+
+Reason:
+
+- the regular-user flow is about deciding what tag should be on the image, not
+  about dataset curation
+- exposing expert-only negative outcomes would add friction and confuse the
+  workflow
+
+### Workflow-Specific Annotation Semantics
+
+For `run_hybrid_review`, the effective review outcomes should be much simpler
+than the expert workflow.
+
+Recommended behavior:
+
+- `save` writes an annotation row with `annotation_status='labeled'`
+- `skip` changes candidate review state only and does not write one of the
+  expert negative annotation outcomes
+
+Reason:
+
+- keeps the regular-user scope semantically clean
+- avoids storing evaluation-oriented negative labels for a workflow that only
+  needs tag-or-skip behavior
 
 ## Apply DB Design
 
@@ -397,7 +467,8 @@ For each source image:
   - do not apply species tags
   - optionally report non-applying outcomes
 
-Statuses that do not apply species labels by default:
+Statuses that do not apply species labels by default in expert
+`detector_review` scopes:
 
 - `reject`
 - `unsure`
@@ -408,6 +479,13 @@ Statuses that do not apply species labels by default:
 - `unreviewed`
 
 This default is intentionally conservative.
+
+For `run_hybrid_review` scopes, the normal non-applying states are just:
+
+- `skipped`
+- `unreviewed`
+
+Expert-only negative outcomes should not ordinarily appear in this workflow.
 
 ## Fingerprints
 
@@ -474,6 +552,8 @@ Responsibilities:
 - auto-apply vs defer decisioning
 - inserting deferred items into the review DB
 - writing seeded suggestion rows
+- ensuring deferred review items are created as `run_hybrid_review` scopes with
+  simplified action semantics
 
 ### `src/review_apply_state.py`
 
@@ -587,11 +667,15 @@ Changes:
 
 - if a seeded suggestion exists for the candidate, use it first
 - otherwise fall back to the existing live suggestion behavior
-- keep UI branching minimal
+- branch the candidate action surface by `workflow_type`
+- keep shared navigation, queueing, preview, recent-label, and suggestion
+  mechanics intact
+- render a simplified regular-user labeling panel for `run_hybrid_review`
 
 Outcome:
 
 - suggestion behavior stays aligned with `review_run`
+- regular-user review avoids expert-only outcomes and stress semantics
 
 ### 6. Add Apply Ledger Persistence
 
@@ -708,6 +792,30 @@ Reason:
 
 - simpler and more robust across environments
 
+### Workflow-Specific UI Shape
+
+Recommended:
+
+- `detector_review` keeps the current expert-oriented annotation controls
+- `run_hybrid_review` uses a simpler action panel:
+  - classifier suggestion if available
+  - label input
+  - recent labels
+  - save label
+  - skip
+
+UI changes for `run_hybrid_review`:
+
+- remove the stress toggle
+- remove reject, unsure, not-a-bird, bad-crop, and duplicate controls
+- replace the "Other Outcomes" section with a single skip action, or remove the
+  section entirely and place skip alongside the primary save action
+
+Reason:
+
+- the regular-user workflow should feel like a tagging/correction tool rather
+  than an annotation workstation
+
 ### Review Completion Behavior
 
 Recommended:
@@ -755,6 +863,7 @@ Add coverage for:
 - review fingerprint generation
 - seeded suggestion upsert/read
 - hybrid-review idempotent candidate creation
+- workflow-specific action validation for `run_hybrid_review`
 - image-level consolidation rules
 - conflict handling
 
@@ -767,6 +876,8 @@ Add coverage for:
 - `apply.db` says applied but Lightroom catalog state differs, causing repair
 - multi-species conflict skip/report behavior
 - unrelated user keywords survive managed-state replacement
+- `run_hybrid_review` scopes expose only label-and-skip behavior in the review
+  UI
 
 ### Manual Tests
 
@@ -825,6 +936,8 @@ The implementation is complete when the following are true:
 - `src.tag_bird` uses the shared writer
 - `src.review_run` exists and supports the hybrid attended flow
 - `review_app` can review deferred `review_run` items without a separate UI
+- `review_app` renders workflow-specific controls so `review_run` items only
+  expose label-and-skip behavior
 - `src.apply_review_labels` can bulk-apply reviewed results from `review.db`
 - rerunning `review_run` does not duplicate review work
 - rerunning apply does not duplicate Lightroom changes
