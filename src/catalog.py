@@ -76,6 +76,7 @@ class CatalogImage:
     rating: Optional[float]
     color_label: Optional[str]
     capture_time: Optional[str]
+    file_uuid: Optional[str] = None
 
 
 class LightroomCatalog:
@@ -173,6 +174,7 @@ class LightroomCatalog:
                 i.captureTime,
                 fi.baseName,
                 fi.extension,
+                fi.id_global,
                 rf.absolutePath,
                 fo.pathFromRoot
             FROM Adobe_images i
@@ -228,6 +230,7 @@ class LightroomCatalog:
                 rating=r["rating"],
                 color_label=r["colorLabels"],
                 capture_time=r["captureTime"],
+                file_uuid=r["id_global"],
             ))
 
         return images
@@ -333,6 +336,52 @@ class LightroomCatalog:
             WHERE ki.image = ?
         """, (image_id,)).fetchall()
         return [r["name"] for r in rows]
+
+    def get_managed_keyword_names_for_image(self, image_id: int) -> set[str]:
+        """
+        Return the set of managed keyword names currently applied to an image.
+
+        Managed keywords are the classifier-owned trees under Bird-Species,
+        Birds, and Classifier-Confidence, plus the top-level
+        'manually classed' keyword.
+        """
+        root_id = self._get_root_keyword_id()
+        managed_names: set[str] = set()
+
+        for kw_name in (KEYWORD_BIRD_SPECIES, KEYWORD_ROOT_NAME, KEYWORD_CONFIDENCE):
+            row = self._conn.execute(
+                "SELECT genealogy FROM AgLibraryKeyword WHERE lc_name = ? AND parent = ?",
+                (kw_name.lower(), root_id),
+            ).fetchone()
+            if not row:
+                continue
+            prefix = row["genealogy"]
+            rows = self._conn.execute(
+                """
+                SELECT DISTINCT k.name
+                FROM AgLibraryKeywordImage ki
+                JOIN AgLibraryKeyword k ON k.id_local = ki.tag
+                WHERE ki.image = ?
+                  AND (k.genealogy = ? OR k.genealogy LIKE ?)
+                """,
+                (image_id, prefix, f"{prefix}/%"),
+            ).fetchall()
+            managed_names.update(r["name"] for r in rows if r["name"])
+
+        manual_row = self._conn.execute(
+            """
+            SELECT DISTINCT k.name
+            FROM AgLibraryKeywordImage ki
+            JOIN AgLibraryKeyword k ON k.id_local = ki.tag
+            WHERE ki.image = ?
+              AND k.lc_name = 'manually classed'
+            """,
+            (image_id,),
+        ).fetchone()
+        if manual_row and manual_row["name"]:
+            managed_names.add(manual_row["name"])
+
+        return managed_names
 
     def get_gps_for_image(self, image_id: int) -> Optional[tuple[float, float]]:
         """Return (latitude, longitude) from EXIF metadata for an image, or None."""

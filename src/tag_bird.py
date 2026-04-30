@@ -307,7 +307,7 @@ def main() -> int:
     from src.catalog import LightroomCatalog, confidence_band
     from src.classification_log import ClassificationLog
     from src.classifier import Prediction
-    from src.xmp_writer import clean_xmp_keywords, write_bird_keywords
+    from src.label_apply import apply_catalog_species_label, species_label_from_taxonomy, write_sidecar_species_labels
 
     manual_pred = Prediction(
         rank=1,
@@ -326,15 +326,10 @@ def main() -> int:
         readonly=False,
         backup=(not args.no_backup),
     ) as cat:
-
-        # Pre-cache keyword IDs that are shared across all images
-        band_kw_id    = cat.ensure_confidence_keyword(confidence_band(1.0))
-        manual_kw_id  = cat.ensure_manually_classed_keyword()
-        top_id        = cat.ensure_bird_species_keyword(display_name)
-        ord_id, kw_id = cat.ensure_species_keyword(order_disp or order, display_name)
-        sci_kw_ids    = (
-            cat.ensure_scientific_keywords(order, family, sci_name)
-            if order and family and sci_name else None
+        label_payload = species_label_from_taxonomy(
+            common_name=display_name,
+            sci_name=sci_name,
+            label=label,
         )
 
         for image_path in image_paths:
@@ -350,20 +345,21 @@ def main() -> int:
             if removed:
                 log.debug(f"  {image_path.name}: removed {removed} existing keyword(s)")
 
-            cat.tag_image(image_id, top_id)
-            cat.tag_image(image_id, ord_id)
-            cat.tag_image(image_id, kw_id)
-            if sci_kw_ids:
-                for kid in sci_kw_ids:
-                    cat.tag_image(image_id, kid)
-            cat.tag_image(image_id, band_kw_id)
-            cat.tag_image(image_id, manual_kw_id)
+            apply_catalog_species_label(
+                cat,
+                image_id,
+                label_payload,
+                confidence_band_name=confidence_band(1.0),
+                manual=True,
+            )
 
             # XMP + log outside the catalog context is fine, but do them here
             # so a keyboard interrupt doesn't leave catalog and XMP out of sync.
-            clean_xmp_keywords(image_path, existing_flat)
-            write_bird_keywords(
-                image_path, display_name, order_disp or order, order, family, sci_name
+            write_sidecar_species_labels(
+                image_path,
+                [label_payload],
+                replace_existing=True,
+                flat_to_remove=existing_flat,
             )
             clf_log.record(image_id, [manual_pred], model="manual")
 

@@ -10,6 +10,7 @@ from pathlib import Path
 
 from PIL import Image
 
+from .lightroom_preview import load_standard_preview
 from .raw_utils import load_image
 
 
@@ -29,8 +30,18 @@ class ReviewSuggester:
 
         self._classifier = Classifier(top_k=1, birds_only=True)
 
-    def suggest(self, image_path: str | Path, bbox: tuple[int, int, int, int]) -> SuggestedLabel | None:
-        prediction = self._predict_top1(str(Path(image_path).resolve()), bbox)
+    def suggest(
+        self,
+        image_path: str | Path,
+        bbox: tuple[int, int, int, int],
+        *,
+        catalog_path: str | Path | None = None,
+    ) -> SuggestedLabel | None:
+        prediction = self._predict_top1(
+            str(Path(image_path).resolve()),
+            bbox,
+            str(Path(catalog_path).resolve()) if catalog_path is not None else None,
+        )
         if prediction is None:
             return None
         return SuggestedLabel(
@@ -41,8 +52,10 @@ class ReviewSuggester:
         )
 
     @lru_cache(maxsize=512)
-    def _predict_top1(self, image_path: str, bbox: tuple[int, int, int, int]):
-        image = load_image(image_path)
+    def _predict_top1(self, image_path: str, bbox: tuple[int, int, int, int], catalog_path: str | None):
+        image = load_standard_preview(catalog_path, image_path) if catalog_path else None
+        if image is None:
+            image = load_image(image_path)
         crop = _crop_with_padding(image, bbox)
         predictions = self._classifier.predict_image(crop, top_k=1)
         return predictions[0] if predictions else None

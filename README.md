@@ -29,6 +29,13 @@ library for the heavy lifting of bird classification.  Big thanks to Ofer Hasson
 - [Project Notes](docs/PROJECT_NOTES.md) — ongoing project maintenance notes and
   documentation expectations
 
+The review UI can also show an external eBird / Macaulay reference panel for
+the current classifier suggestion or resolved label. This uses a locally cached
+species-code map derived from the official eBird taxonomy workbook and loads a
+remote reference image/link at review time; the media itself is not stored in
+the review database or exported datasets. An internet connection is required
+when the UI resolves the external reference.
+
 ## What it does
 
 For each untagged RAW/DNG (or TIFF, PSD, PSB) bird photo the script:

@@ -121,6 +121,7 @@ class CatalogExtractorTest(unittest.TestCase):
             rating=4.0,
             color_label=None,
             capture_time="2026-04-22T17:00:00Z",
+            file_uuid=None,
         )
         fake_catalog = FakeCatalog([image])
         extractor = CatalogExtractor(store, FakeDetector(), FakePreviewProvider(tmpdir))
@@ -158,6 +159,7 @@ class CatalogExtractorTest(unittest.TestCase):
             rating=4.0,
             color_label=None,
             capture_time="2026-04-22T17:00:00Z",
+            file_uuid=None,
         )
         fake_catalog = FakeCatalog([image])
         extractor = CatalogExtractor(
@@ -199,6 +201,7 @@ class CatalogExtractorTest(unittest.TestCase):
             rating=4.0,
             color_label=None,
             capture_time="2026-04-22T17:00:00Z",
+            file_uuid=None,
         )
         fake_catalog = FakeCatalog([image])
         extractor = CatalogExtractor(store, FakeDetector(), FakePreviewProvider(tmpdir))

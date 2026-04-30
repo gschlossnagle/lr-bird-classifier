@@ -12,7 +12,7 @@ from typing import Any
 
 from .review_validation import validate_annotation_row, validate_candidate_row
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class ReviewStore:
@@ -52,6 +52,7 @@ class ReviewStore:
                 catalog_name TEXT NOT NULL,
                 catalog_path TEXT NOT NULL,
                 trip_folder  TEXT NOT NULL,
+                workflow_type TEXT NOT NULL DEFAULT 'detector_review',
                 created_at   TEXT NOT NULL,
                 last_opened_at TEXT,
                 status       TEXT NOT NULL DEFAULT 'active',
@@ -151,6 +152,19 @@ class ReviewStore:
                 scope_key      TEXT PRIMARY KEY,
                 cursor_value   TEXT,
                 updated_at     TEXT NOT NULL
+            );
+
+            CREATE TABLE candidate_seed_suggestions (
+                candidate_id        TEXT PRIMARY KEY,
+                model               TEXT NOT NULL,
+                best_truth_label    TEXT,
+                best_common_name    TEXT,
+                best_sci_name       TEXT,
+                best_confidence     REAL,
+                top_predictions_json TEXT,
+                geo_filtered        INTEGER NOT NULL DEFAULT 0,
+                seeded_at           TEXT NOT NULL,
+                FOREIGN KEY (candidate_id) REFERENCES candidates(id)
             );
 
             CREATE INDEX idx_scopes_last_opened_at ON review_scopes (last_opened_at);
@@ -256,6 +270,28 @@ class ReviewStore:
                 self._conn.execute("PRAGMA foreign_keys = ON")
             current_version = 3
 
+        if current_version == 3:
+            self._conn.executescript(
+                """
+                ALTER TABLE review_scopes
+                    ADD COLUMN workflow_type TEXT NOT NULL DEFAULT 'detector_review';
+
+                CREATE TABLE candidate_seed_suggestions (
+                    candidate_id        TEXT PRIMARY KEY,
+                    model               TEXT NOT NULL,
+                    best_truth_label    TEXT,
+                    best_common_name    TEXT,
+                    best_sci_name       TEXT,
+                    best_confidence     REAL,
+                    top_predictions_json TEXT,
+                    geo_filtered        INTEGER NOT NULL DEFAULT 0,
+                    seeded_at           TEXT NOT NULL,
+                    FOREIGN KEY (candidate_id) REFERENCES candidates(id)
+                );
+                """
+            )
+            current_version = 4
+
         if current_version != SCHEMA_VERSION:
             raise RuntimeError(
                 f"Unsupported review store schema version {current_version}; "
@@ -280,21 +316,23 @@ class ReviewStore:
         catalog_name: str,
         catalog_path: str,
         trip_folder: str,
+        workflow_type: str = "detector_review",
         created_at: str,
     ) -> None:
         with self._lock:
             self._conn.execute(
                 """
                 INSERT INTO review_scopes (
-                    scope_key, scope_name, catalog_name, catalog_path, trip_folder, created_at, status
-                ) VALUES (?, ?, ?, ?, ?, ?, 'active')
+                    scope_key, scope_name, catalog_name, catalog_path, trip_folder, workflow_type, created_at, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active')
                 ON CONFLICT(scope_key) DO UPDATE SET
                     scope_name = excluded.scope_name,
                     catalog_name = excluded.catalog_name,
                     catalog_path = excluded.catalog_path,
-                    trip_folder = excluded.trip_folder
+                    trip_folder = excluded.trip_folder,
+                    workflow_type = excluded.workflow_type
                 """,
-                (scope_key, scope_name, catalog_name, catalog_path, trip_folder, created_at),
+                (scope_key, scope_name, catalog_name, catalog_path, trip_folder, workflow_type, created_at),
             )
             self._conn.commit()
 
@@ -321,6 +359,7 @@ class ReviewStore:
                 LEFT JOIN images i ON i.scope_key = s.scope_key
                 LEFT JOIN candidates c ON c.image_id = i.id
                 GROUP BY s.scope_key, s.scope_name, s.catalog_name, s.catalog_path, s.trip_folder,
+                         s.workflow_type,
                          s.created_at, s.last_opened_at, s.status, s.notes
                 ORDER BY COALESCE(s.last_opened_at, s.created_at) DESC, s.scope_name ASC
                 """
@@ -479,6 +518,67 @@ class ReviewStore:
         with self._lock:
             self._conn.execute("DELETE FROM extraction_cursors WHERE scope_key = ?", (scope_key,))
             self._conn.commit()
+
+    def upsert_seed_suggestion(
+        self,
+        candidate_id: str,
+        *,
+        model: str,
+        best_truth_label: str | None,
+        best_common_name: str | None,
+        best_sci_name: str | None,
+        best_confidence: float | None,
+        top_predictions: list[dict[str, Any]] | None,
+        geo_filtered: bool,
+        seeded_at: str,
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO candidate_seed_suggestions (
+                    candidate_id, model, best_truth_label, best_common_name, best_sci_name,
+                    best_confidence, top_predictions_json, geo_filtered, seeded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(candidate_id) DO UPDATE SET
+                    model = excluded.model,
+                    best_truth_label = excluded.best_truth_label,
+                    best_common_name = excluded.best_common_name,
+                    best_sci_name = excluded.best_sci_name,
+                    best_confidence = excluded.best_confidence,
+                    top_predictions_json = excluded.top_predictions_json,
+                    geo_filtered = excluded.geo_filtered,
+                    seeded_at = excluded.seeded_at
+                """,
+                (
+                    candidate_id,
+                    model,
+                    best_truth_label,
+                    best_common_name,
+                    best_sci_name,
+                    best_confidence,
+                    json.dumps(top_predictions) if top_predictions is not None else None,
+                    int(geo_filtered),
+                    seeded_at,
+                ),
+            )
+            self._conn.commit()
+
+    def get_seed_suggestion(self, candidate_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM candidate_seed_suggestions WHERE candidate_id = ?",
+                (candidate_id,),
+            ).fetchone()
+            if not row:
+                return None
+            result = dict(row)
+            result["geo_filtered"] = bool(result["geo_filtered"])
+            if result.get("top_predictions_json"):
+                result["top_predictions"] = json.loads(result["top_predictions_json"])
+            else:
+                result["top_predictions"] = None
+            result.pop("top_predictions_json", None)
+            return result
 
     def delete_images_by_source_paths(self, source_paths: list[str], *, scope_key: str | None = None) -> int:
         """
@@ -741,6 +841,65 @@ class ReviewStore:
             result = dict(row)
             for key in ("stress", "reject_sample", "unsure", "not_a_bird", "bad_crop", "duplicate_sample"):
                 result[key] = bool(result[key])
+            return result
+
+    def list_reviewed_image_annotations(self, *, scope_key: str | None = None) -> list[dict[str, Any]]:
+        """
+        Return reviewed candidate/image/annotation rows joined for apply/export flows.
+
+        One row is returned per reviewed candidate with image, scope, and
+        annotation fields flattened together for easier downstream grouping.
+        """
+        sql = """
+            SELECT
+                s.scope_key AS scope_key,
+                s.scope_name AS scope_name,
+                s.catalog_name AS catalog_name,
+                s.catalog_path AS catalog_path,
+                s.trip_folder AS trip_folder,
+                s.workflow_type AS workflow_type,
+                i.id AS image_row_id,
+                i.source_image_id AS source_image_id,
+                i.source_image_path AS source_image_path,
+                i.capture_datetime AS capture_datetime,
+                i.folder AS folder,
+                i.burst_group_id AS burst_group_id,
+                c.id AS candidate_id,
+                c.review_status AS review_status,
+                c.reviewed_at AS reviewed_at,
+                a.annotation_status AS annotation_status,
+                a.truth_common_name AS truth_common_name,
+                a.truth_sci_name AS truth_sci_name,
+                a.truth_label AS truth_label,
+                a.taxon_class AS taxon_class,
+                a.resolved_from_input AS resolved_from_input,
+                a.stress AS stress,
+                a.reject_sample AS reject_sample,
+                a.unsure AS unsure,
+                a.not_a_bird AS not_a_bird,
+                a.bad_crop AS bad_crop,
+                a.duplicate_sample AS duplicate_sample,
+                a.notes AS notes,
+                a.annotated_at AS annotated_at
+            FROM annotations a
+            JOIN candidates c ON c.id = a.candidate_id
+            JOIN images i ON i.id = c.image_id
+            JOIN review_scopes s ON s.scope_key = i.scope_key
+            WHERE 1 = 1
+        """
+        params: list[Any] = []
+        if scope_key is not None:
+            sql += " AND s.scope_key = ?"
+            params.append(scope_key)
+        sql += " ORDER BY julianday(i.capture_datetime) ASC, i.capture_datetime ASC, c.id ASC"
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+            result: list[dict[str, Any]] = []
+            for row in rows:
+                item = dict(row)
+                for key in ("stress", "reject_sample", "unsure", "not_a_bird", "bad_crop", "duplicate_sample"):
+                    item[key] = bool(item[key])
+                result.append(item)
             return result
 
     def recent_labels(self, limit: int = 5) -> list[dict[str, Any]]:
