@@ -251,6 +251,44 @@ def _run_apply_phase(
         return engine.run()
 
 
+def _scope_review_status(*, review_db: Path, scope_key: str) -> tuple[int, int]:
+    with ReviewStore(review_db) as review_store:
+        reviewed_count = len(review_store.list_reviewed_image_annotations(scope_key=scope_key))
+        unreviewed_images = review_store.count_candidate_images(scope_key=scope_key, review_status="unreviewed")
+    return reviewed_count, unreviewed_images
+
+
+def _print_seed_summary(*, auto_applied: int, deferred: int, review_db: Path, launch_ui: bool) -> None:
+    if auto_applied and not deferred:
+        print(f"Auto-applied labels to {auto_applied} image(s). No review is needed.")
+        return
+    if auto_applied and deferred:
+        print(
+            f"Auto-applied labels to {auto_applied} image(s) and queued {deferred} image(s) for review."
+        )
+    elif deferred:
+        print(f"Queued {deferred} image(s) for review.")
+    else:
+        print("No images needed tagging or review in this run.")
+        return
+    if deferred and launch_ui:
+        print("Review the queued images in the browser. Only reviewed labels will be applied afterward.")
+    elif deferred:
+        print(f"Queued review items are stored in {review_db}. Launch review_app to continue.")
+
+
+def _print_apply_summary(*, summary: dict[str, int], dry_run: bool) -> None:
+    verb = "Would apply" if dry_run else "Applied"
+    print(
+        (
+            f"{verb} reviewed labels for {summary['applied'] + summary['repaired']} image(s); "
+            f"{summary['verified_skipped']} already matched, "
+            f"{summary['conflicts']} conflicted, {summary['no_label']} had no label outcome, "
+            f"{summary['errors']} errored."
+        )
+    )
+
+
 def main() -> int:
     args = parse_args()
     logging.basicConfig(
@@ -386,6 +424,12 @@ def main() -> int:
             clf_log.close()
 
     log.info("review_run seed complete: auto_applied=%s deferred=%s skipped=%s errors=%s", auto_applied, deferred, skipped, errors)
+    _print_seed_summary(
+        auto_applied=auto_applied,
+        deferred=deferred,
+        review_db=review_db_path,
+        launch_ui=deferred and not args.no_launch_ui,
+    )
 
     if deferred and not args.no_launch_ui:
         _launch_review_ui(
@@ -396,14 +440,30 @@ def main() -> int:
         )
 
     if not args.no_apply_reviewed:
-        summary = _run_apply_phase(
-            review_db=review_db_path,
-            apply_state_db=apply_state_db_path,
-            catalog_path=catalog_path,
-            scope_key=scope_key,
-            dry_run=args.dry_run,
-        )
-        log.info("review_run apply summary: %s", summary)
+        reviewed_count, unreviewed_images = _scope_review_status(review_db=review_db_path, scope_key=scope_key)
+        if reviewed_count == 0:
+            if unreviewed_images:
+                log.info(
+                    "review_run apply skipped: no reviewed labels yet for this scope; %s images remain in the review queue.",
+                    unreviewed_images,
+                )
+                print(
+                    f"Review is still pending for {unreviewed_images} image(s). "
+                    "No reviewed labels were applied yet."
+                )
+            else:
+                log.info("review_run apply skipped: no reviewed labels available for this scope.")
+                print("No reviewed labels were available to apply for this scope.")
+        else:
+            summary = _run_apply_phase(
+                review_db=review_db_path,
+                apply_state_db=apply_state_db_path,
+                catalog_path=catalog_path,
+                scope_key=scope_key,
+                dry_run=args.dry_run,
+            )
+            log.info("review_run apply summary: %s", summary)
+            _print_apply_summary(summary=summary, dry_run=args.dry_run)
 
     return 0
 
