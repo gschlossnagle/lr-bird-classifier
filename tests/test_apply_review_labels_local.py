@@ -38,6 +38,12 @@ class ApplyReviewLabelsTest(unittest.TestCase):
         self.assertTrue(args.dry_run)
         self.assertEqual(args.report, "report.jsonl")
 
+    def test_main_returns_error_for_missing_review_db(self) -> None:
+        self.review_db.unlink()
+        with patch("sys.argv", self._argv()):
+            rc = main()
+        self.assertEqual(rc, 1)
+
     def test_exit_code_prefers_errors(self) -> None:
         code = _exit_code_for_summary({"errors": 1, "conflicts": 4}, dry_run=False)
         self.assertEqual(code, 1)

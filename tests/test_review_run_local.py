@@ -141,6 +141,13 @@ class ReviewRunParseArgsTest(unittest.TestCase):
         store.ensure_scope.assert_called_once()
         mocked_replace_catalog_labels.assert_called_once()
         mocked_write_sidecar.assert_called_once()
+        self.assertEqual(
+            mocked_write_sidecar.call_args.kwargs,
+            {
+                "replace_existing": True,
+                "flat_to_remove": [],
+            },
+        )
         clf_log.record.assert_called_once()
         mocked_launch_ui.assert_not_called()
         mocked_run_apply.assert_not_called()

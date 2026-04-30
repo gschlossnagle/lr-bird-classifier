@@ -77,6 +77,37 @@ def flat_keywords_for_label(label: SpeciesLabel) -> list[str]:
     )
 
 
+def existing_flat_tags_from_log(clf_log, image_id: int) -> list[str]:
+    """Build the managed flat-keyword set for an image from classification-log rows."""
+    try:
+        rows = clf_log.get_all_rows()
+    except Exception:
+        return []
+
+    flat: list[str] = []
+    try:
+        iterator = iter(rows)
+    except TypeError:
+        return []
+
+    for row in iterator:
+        if row["image_id"] != image_id:
+            continue
+        parsed = parse_label(row.get("label") or "")
+        order_raw = parsed.get("order", "")
+        order_disp = get_order_display_name(order_raw) if order_raw else ""
+        flat.extend(
+            [
+                row.get("common_name") or "",
+                order_disp,
+                order_raw,
+                parsed.get("family", ""),
+                row.get("sci_name") or "",
+            ]
+        )
+    return list(dict.fromkeys(v for v in flat if v))
+
+
 def managed_keyword_names_for_labels(
     labels: Iterable[SpeciesLabel],
     *,
