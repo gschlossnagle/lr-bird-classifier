@@ -17,6 +17,7 @@ import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from time import monotonic
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -28,7 +29,7 @@ from .review_queue import QueueFilters, ReviewQueue
 from .review_assets import BoxedPreviewProvider
 from .review_suggester import ReviewSuggester, SuggestedLabel
 from .review_store import ReviewStore
-from .subject_size_estimate import estimated_subject_box_size_for_candidate
+from .subject_size_estimate import estimated_subject_box_size_for_candidate, load_subject_size_metadata
 
 STRESS_SUGGESTION_CONFIDENCE_THRESHOLD = 0.35
 WORKFLOW_DETECTOR_REVIEW = "detector_review"
@@ -245,6 +246,34 @@ def load_label_inventory(path: str | Path) -> list[str]:
     return list(dict.fromkeys(labels))
 
 
+AGGREGATE_SCOPE_KEY_PREFIX = "__aggregate__:"
+
+
+def _aggregate_scope_key(catalog_path: str, trip_folder: str) -> str:
+    payload = {
+        "catalog_path": str(Path(catalog_path).resolve()),
+        "trip_folder": str(Path(trip_folder).resolve()),
+    }
+    return AGGREGATE_SCOPE_KEY_PREFIX + json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _parse_aggregate_scope_key(scope_key: str | None) -> dict[str, str] | None:
+    if not scope_key or not scope_key.startswith(AGGREGATE_SCOPE_KEY_PREFIX):
+        return None
+    try:
+        payload = json.loads(scope_key.removeprefix(AGGREGATE_SCOPE_KEY_PREFIX))
+    except json.JSONDecodeError:
+        return None
+    catalog_path = payload.get("catalog_path")
+    trip_folder = payload.get("trip_folder")
+    if not catalog_path or not trip_folder:
+        return None
+    return {
+        "catalog_path": str(Path(catalog_path).resolve()),
+        "trip_folder": str(Path(trip_folder).resolve()),
+    }
+
+
 def _html_page(title: str, body: str) -> bytes:
     doc = f"""<!doctype html>
 <html>
@@ -252,171 +281,444 @@ def _html_page(title: str, body: str) -> bytes:
   <meta charset="utf-8">
   <title>{html.escape(title)}</title>
   <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin: 0; background: #f4f1ea; color: #1b1b1b; }}
-    .page {{ padding: 20px; }}
-    .app-shell {{ display: grid; gap: 16px; }}
-    .topbar {{ display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 12px; }}
-    .topbar h1 {{ margin: 0; font-size: 28px; line-height: 1.1; }}
-    .scope-pill {{ background: #f7f2ea; border: 1px solid #ddd4c5; border-radius: 10px; padding: 8px 12px; min-width: 0; }}
-    .scope-pill .label {{ display: block; font-size: 12px; color: #5e564a; margin-bottom: 2px; }}
-    .scope-pill .value {{ display: block; font-size: 15px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
-    .topbar-actions {{ display: flex; gap: 8px; align-items: center; }}
-    .header-status {{ display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }}
-    .status-badge {{ background: #f7f2ea; border: 1px solid #ddd4c5; border-radius: 999px; padding: 7px 10px; font-size: 13px; white-space: nowrap; }}
-    .wrap {{ display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(360px, 0.9fr); gap: 20px; align-items: start; }}
-    .panel {{ background: #fffdf9; border: 1px solid #ddd4c5; border-radius: 12px; padding: 14px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }}
-    .preview-panel {{ display: flex; flex-direction: column; }}
-    .preview-frame {{ display: flex; justify-content: center; align-items: flex-start; min-height: 0; }}
-    img {{ max-width: 100%; max-height: 82vh; width: auto; height: auto; display: block; border-radius: 8px; }}
-    .candidate-preview {{ max-height: 50vh; }}
-    .preview-controls {{ margin-top: 12px; display: grid; gap: 10px; }}
-    .meta {{ font-size: 14px; line-height: 1.5; }}
-    .meta code {{ font-size: 12px; }}
-    .error {{ color: #8b1e1e; font-weight: 600; }}
-    .recent form, .actions form {{ display: inline-block; margin: 4px 4px 0 0; }}
-    button {{ border: 1px solid #aa9f8f; background: #f7f2ea; border-radius: 8px; padding: 6px 10px; cursor: pointer; font-size: 13px; line-height: 1.25; }}
-    button.primary {{ background: #184e3b; color: white; border-color: #184e3b; }}
-    input[type=text] {{ width: 100%; padding: 8px 10px; border-radius: 8px; border: 1px solid #c9bfaf; box-sizing: border-box; }}
-    input.manual-label-input {{ width: 100%; max-width: 420px; }}
-    label.toggle {{ display: inline-flex; align-items: center; gap: 8px; margin: 8px 0; }}
-    .small {{ font-size: 12px; color: #5e564a; }}
-    .resolved {{ background: #f7f2ea; border-radius: 8px; padding: 8px 10px; margin-top: 8px; }}
+    :root {{
+      --bg: #0E0F11;
+      --panel: #16181B;
+      --panel2: #1C1F23;
+      --rule: #26292E;
+      --rule2: #1F2226;
+      --ink: #F2EFE9;
+      --ink2: #C9C4B9;
+      --ink3: #8A857A;
+      --ink4: #5C5852;
+      --accent: #F0B45A;
+      --accent-soft: rgba(240, 180, 90, 0.16);
+      --accent-ink: #F7D7A3;
+      --danger: #C76464;
+      --danger-ink: #E6A2A2;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: Inter, -apple-system, BlinkMacSystemFont, sans-serif;
+    }}
+    .page {{ min-height: 100vh; padding: 0; }}
+    .app-shell {{ min-height: 100vh; display: flex; flex-direction: column; }}
+    .wrap {{ flex: 1; min-height: 0; display: grid; grid-template-columns: 84px minmax(0, 1fr); }}
+    .topbar {{
+      height: 42px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      padding: 8px 16px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--rule);
+    }}
+    .topbar-left, .topbar-right {{ display: flex; align-items: center; gap: 14px; min-width: 0; }}
+    .topbar h1 {{ margin: 0; font-size: 14px; font-weight: 600; letter-spacing: -0.2px; }}
+    .divider {{ width: 1px; height: 14px; background: var(--rule); flex: 0 0 auto; }}
+    .topbar-stanza {{ min-width: 0; }}
+    .topbar-value {{
+      font-size: 13px;
+      color: var(--ink2);
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }}
+    .mono-label {{
+      font-family: "SFMono-Regular", ui-monospace, monospace;
+      font-size: 10px;
+      letter-spacing: 0.7px;
+      text-transform: uppercase;
+      color: var(--ink3);
+    }}
+    .mono-small {{
+      font-family: "SFMono-Regular", ui-monospace, monospace;
+      font-size: 11px;
+      color: var(--ink3);
+    }}
+    .progress-numbers {{
+      font-size: 12px;
+      color: var(--ink2);
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }}
+    .progress-numbers strong {{ color: var(--ink); font-weight: 600; }}
+    .progress-track {{ width: 160px; height: 4px; background: var(--rule); border-radius: 99px; overflow: hidden; }}
+    .progress-fill {{ height: 100%; background: var(--accent); }}
+    .topbar-actions {{ display: flex; align-items: center; gap: 8px; }}
+    .btn, button {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 7px;
+      padding: 5px 10px;
+      border: 1px solid var(--rule);
+      border-radius: 7px;
+      background: transparent;
+      color: var(--ink2);
+      font-size: 12.5px;
+      cursor: pointer;
+      white-space: nowrap;
+    }}
+    .btn:hover, button:hover {{ border-color: #373c43; color: var(--ink); }}
+    .btn-accent, button.primary {{
+      background: var(--accent);
+      color: #1A1408;
+      border-color: var(--accent);
+      font-weight: 600;
+    }}
+    .btn-danger {{ color: var(--danger-ink); border-color: rgba(199,100,100,0.45); }}
+    .keycap {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 18px;
+      height: 18px;
+      padding: 0 5px;
+      border-radius: 4px;
+      border: 1px solid rgba(255,255,255,0.12);
+      background: rgba(255,255,255,0.06);
+      color: var(--ink2);
+      font-family: "SFMono-Regular", ui-monospace, monospace;
+      font-size: 10.5px;
+      font-weight: 500;
+      letter-spacing: 0.3px;
+    }}
+    .keycap-accent {{ background: var(--accent-soft); border-color: rgba(240,180,90,0.5); color: var(--accent-ink); }}
+    .keycap-danger {{ background: rgba(199,100,100,0.12); border-color: rgba(199,100,100,0.45); color: var(--danger-ink); }}
+    .rail {{
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding: 12px 8px;
+      background: var(--panel);
+      border-right: 1px solid var(--rule);
+      min-height: 0;
+    }}
+    .rail-spacer {{ height: 8px; }}
+    .rail-fill {{ flex: 1; }}
+    .rail-tile {{
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 4px;
+      width: 100%;
+      padding: 8px 4px;
+      border: 1px solid var(--rule);
+      border-radius: 8px;
+      background: transparent;
+      color: var(--ink2);
+      text-align: center;
+    }}
+    .rail-tile.accept {{ background: var(--accent-soft); border-color: rgba(240,180,90,0.45); color: var(--accent-ink); }}
+    .rail-tile.danger {{ color: var(--danger-ink); }}
+    .rail-tile-label {{ font-size: 11px; line-height: 1.15; }}
+    .review-body {{
+      min-height: 0;
+      display: grid;
+      grid-template-columns: minmax(0, 2.1fr) 320px;
+      gap: 12px;
+      padding: 12px;
+      align-items: stretch;
+    }}
+    .photo-column, .inspector-column {{ min-height: 0; display: flex; flex-direction: column; }}
+    .photo-column {{ gap: 8px; }}
+    .inspector-column {{ gap: 8px; }}
+    .stage-header {{ display: flex; align-items: center; justify-content: space-between; gap: 10px; }}
+    .stage-header-controls {{ display: flex; gap: 6px; }}
+    .photo-frame {{
+      flex: 1;
+      min-height: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #000;
+      border: 1px solid var(--rule);
+      overflow: hidden;
+    }}
+    img {{ max-width: 100%; display: block; }}
+    .candidate-preview {{ width: 100%; height: 100%; object-fit: contain; max-height: calc(100vh - 305px); }}
+    .classifier-banner {{
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      padding: 10px 12px;
+      background: var(--panel);
+      border: 1px solid var(--rule);
+      border-left: 2px solid var(--accent);
+      border-radius: 8px;
+    }}
+    .classifier-status {{ display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }}
+    .status-dot {{
+      width: 7px;
+      height: 7px;
+      border-radius: 999px;
+      background: var(--accent);
+      box-shadow: 0 0 0 3px rgba(240,180,90,0.18);
+    }}
+    .classifier-main {{ flex: 1; min-width: 0; }}
+    .classifier-name {{ font-size: 17px; font-weight: 600; letter-spacing: -0.2px; color: var(--ink); }}
+    .classifier-sci {{ margin-top: 2px; font-size: 13px; color: var(--ink3); font-style: italic; }}
+    .classifier-fallback {{ font-size: 13px; color: var(--ink2); }}
+    .classifier-meta {{ margin-top: 4px; display: flex; align-items: center; gap: 8px; }}
+    .classifier-confidence {{ max-width: 280px; flex: 1; height: 3px; background: var(--rule); border-radius: 99px; overflow: hidden; }}
+    .classifier-confidence-fill {{ height: 100%; background: var(--accent); }}
+    .classifier-confidence-value {{
+      font-family: "SFMono-Regular", ui-monospace, monospace;
+      font-size: 11.5px;
+      color: var(--accent-ink);
+      font-weight: 500;
+    }}
+    .panel {{
+      background: var(--panel);
+      border: 1px solid var(--rule);
+      border-radius: 8px;
+      padding: 8px;
+    }}
     .full {{ grid-column: 1 / -1; }}
-    .nav {{ display: flex; gap: 10px; margin-bottom: 14px; }}
-    .nav.compact {{ margin-bottom: 0; }}
-    .details-meta {{ margin-top: 8px; }}
-    details.details-meta {{ background: #f7f2ea; border-radius: 10px; border: 1px solid #ddd4c5; padding: 0; overflow: hidden; }}
-    details.details-meta summary {{ cursor: pointer; list-style: none; padding: 10px 12px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }}
-    details.details-meta summary::-webkit-details-marker {{ display: none; }}
-    .details-summary-main {{ min-width: 0; }}
-    .details-summary-title {{ display: block; font-size: 12px; color: #5e564a; margin-bottom: 2px; }}
-    .details-summary-value {{ display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }}
-    .details-summary-burst {{ flex: 0 0 auto; font-size: 14px; color: #5e564a; }}
-    .details-body {{ padding: 0 12px 12px 12px; }}
-    .details-grid {{ display: grid; grid-template-columns: 1fr; gap: 4px; }}
-    .meta-strip {{ display: flex; align-items: center; justify-content: space-between; gap: 12px; background: #f7f2ea; border: 1px solid #ddd4c5; border-radius: 10px; padding: 8px 12px; margin-bottom: 8px; }}
-    .meta-strip .source-compact {{ min-width: 0; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
-    .meta-strip .burst-compact {{ flex: 0 0 auto; font-size: 13px; color: #5e564a; }}
-    .right-stack {{ display: grid; gap: 8px; align-content: start; }}
-    .reference-card {{ display: grid; grid-template-columns: 96px minmax(0, 1fr); gap: 10px; align-items: start; }}
-    .reference-thumb {{ width: 96px; height: 96px; object-fit: cover; max-height: 96px; }}
-    .reference-card img {{ max-height: 96px; width: 96px; object-fit: cover; }}
-    .button-cluster {{ display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }}
-    .manual-label-row {{ display: grid; grid-template-columns: minmax(220px, 420px) auto; align-items: center; column-gap: 12px; row-gap: 8px; margin-top: 6px; }}
-    .manual-label-row .manual-label-input {{ min-width: 0; }}
-    .form-actions {{ display: flex; align-items: center; justify-content: flex-start; gap: 12px; flex-wrap: nowrap; margin-top: 0; }}
-    .form-actions-left {{ display: flex; gap: 8px; align-items: center; flex-wrap: nowrap; }}
+    .inspector-card {{ display: flex; flex-direction: column; gap: 8px; }}
+    .inspector-header {{ display: flex; align-items: center; justify-content: space-between; gap: 8px; }}
+    .reference-thumb {{
+      width: 100%;
+      height: 180px;
+      border: 1px solid var(--rule);
+      border-radius: 4px;
+      overflow: hidden;
+      background: linear-gradient(135deg, rgba(255,255,255,0.03) 25%, transparent 25%, transparent 50%, rgba(255,255,255,0.03) 50%, rgba(255,255,255,0.03) 75%, transparent 75%, transparent);
+      background-size: 12px 12px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }}
+    .reference-thumb img {{ width: 100%; height: 100%; object-fit: cover; }}
+    .reference-actions {{ display: flex; gap: 6px; }}
+    .reference-actions > * {{ flex: 1; }}
+    .details-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 8px 12px; }}
+    .detail-item {{ display: grid; gap: 2px; min-width: 0; }}
+    .detail-value {{
+      font-family: "SFMono-Regular", ui-monospace, monospace;
+      font-size: 11.5px;
+      color: var(--ink);
+      font-variant-numeric: tabular-nums;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }}
+    .details-divider {{ border-top: 1px solid var(--rule); padding-top: 8px; margin-top: 4px; }}
+    .details-row {{ display: flex; justify-content: space-between; gap: 10px; font-family: "SFMono-Regular", ui-monospace, monospace; font-size: 11px; color: var(--ink3); }}
+    .details-row span:last-child {{ text-align: right; }}
+    .path-text {{ font-family: "SFMono-Regular", ui-monospace, monospace; font-size: 10.5px; color: var(--ink3); word-break: break-all; }}
+    .copyable-path {{ cursor: pointer; transition: color 120ms ease; }}
+    .copyable-path:hover {{ color: var(--ink); }}
+    .note-input, .manual-label-input {{
+      width: 100%;
+      padding: 8px 10px;
+      border-radius: 6px;
+      border: 1px solid var(--rule);
+      background: var(--panel2);
+      color: var(--ink);
+      font-size: 13px;
+      outline: none;
+    }}
+    .note-input::placeholder, .manual-label-input::placeholder {{ color: var(--ink4); }}
+    .bottom-bar {{
+      height: 56px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 8px 14px;
+      background: var(--panel);
+      border-top: 1px solid var(--rule);
+      flex-wrap: nowrap;
+    }}
+    .manual-label-wrap {{ width: 220px; flex: 0 0 220px; }}
+    .recent-strip {{ display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-width: 0; }}
+    .recent-btn {{
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 5px 10px;
+      border-radius: 7px;
+      border: 1px solid var(--rule);
+      background: transparent;
+      color: var(--ink2);
+      font-size: 12.5px;
+      cursor: pointer;
+      max-width: 220px;
+    }}
+    .recent-btn .label-text {{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+    .stress-chip {{
+      margin-left: auto;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 5px 10px 5px 8px;
+      border: 1px solid var(--rule);
+      border-radius: 6px;
+      color: var(--ink2);
+      white-space: nowrap;
+    }}
+    .stress-chip input {{ margin: 0; accent-color: var(--accent); }}
+    .small {{ font-size: 12px; color: var(--ink3); }}
+    .resolved, .error {{
+      padding: 10px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--rule);
+      background: var(--panel2);
+    }}
+    .error {{ color: #f0b1b1; }}
     table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
-    th, td {{ text-align: left; padding: 8px 10px; border-bottom: 1px solid #ddd4c5; vertical-align: top; }}
-    th {{ font-size: 13px; color: #5e564a; }}
-    @media (max-width: 980px) {{
-      .wrap {{ grid-template-columns: 1fr; }}
-      .topbar {{ grid-template-columns: 1fr; }}
-      .scope-pill .value {{ white-space: normal; }}
-      .reference-card {{ grid-template-columns: 1fr; }}
-      .reference-card img, .reference-thumb {{ width: 100%; height: auto; max-height: 180px; }}
-      .meta-strip {{ align-items: flex-start; flex-direction: column; }}
-      .manual-label-row {{ grid-template-columns: 1fr; }}
-      .form-actions, .form-actions-left {{ flex-wrap: wrap; }}
+    th, td {{ text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--rule); vertical-align: top; }}
+    th {{ font-size: 13px; color: var(--ink3); }}
+    a {{ color: inherit; }}
+    code {{ font-family: "SFMono-Regular", ui-monospace, monospace; }}
+    @media (max-width: 1200px) {{
+      .review-body {{ grid-template-columns: minmax(0, 1fr); }}
+      .inspector-column {{ width: auto; }}
+      .bottom-bar {{ height: auto; flex-wrap: wrap; }}
+      .manual-label-wrap {{ width: 100%; flex-basis: 100%; }}
+      .stress-chip {{ margin-left: 0; }}
     }}
   </style>
 </head>
 <body>
 {body}
 <script>
-document.addEventListener('keydown', function (event) {{
-  const active = document.activeElement;
-  const activeTag = (active && active.tagName || '').toLowerCase();
-  const activeType = (active && active.type || '').toLowerCase();
-  const isTextInput = activeTag === 'textarea' || (activeTag === 'input' && !['hidden', 'checkbox', 'button', 'submit'].includes(activeType));
+document.addEventListener('DOMContentLoaded', function () {{
   const textInput = document.querySelector('input[name="label_input"]');
-  const reviewForm = document.querySelector('form[data-role="review-form"]');
+  const reviewForm = document.getElementById('review-form');
   const selectedTruthLabel = document.getElementById('selected-truth-label');
+  const actionInput = document.getElementById('review-action');
+  const noteInput = document.getElementById('note-input');
+  const copyablePaths = document.querySelectorAll('[data-copy-path]');
 
-  function submitResolvedLabel(truthLabel) {{
-    if (!reviewForm || !selectedTruthLabel) {{
+  function syncNotes(form) {{
+    if (!form || !noteInput) {{
+      return;
+    }}
+    const noteField = form.querySelector('input[name="notes"]');
+    if (noteField) {{
+      noteField.value = noteInput.value;
+    }}
+  }}
+
+  function submitResolvedLabel(truthLabel, actionValue) {{
+    if (!reviewForm || !selectedTruthLabel || !actionInput) {{
       return false;
     }}
-    if (textInput) {{
+    selectedTruthLabel.value = truthLabel || '';
+    actionInput.value = actionValue || 'save';
+    if (actionValue === 'save' && textInput && truthLabel) {{
       textInput.value = '';
     }}
-    selectedTruthLabel.value = truthLabel;
+    syncNotes(reviewForm);
     reviewForm.submit();
     return true;
   }}
 
-  if (/^[1-5]$/.test(event.key) && !isTextInput) {{
-    const form = document.querySelector('form[data-recent-index="' + event.key + '"]');
-    if (form) {{
-      const truthLabel = form.getAttribute('data-truth-label');
+  document.querySelectorAll('button[data-resolved-label]').forEach(function (button) {{
+    button.addEventListener('click', function (event) {{
       event.preventDefault();
-      if (truthLabel && submitResolvedLabel(truthLabel)) {{
+      submitResolvedLabel(button.getAttribute('data-truth-label') || '', button.getAttribute('data-submit-action') || 'save');
+    }});
+  }});
+
+  document.querySelectorAll('form').forEach(function (form) {{
+    form.addEventListener('submit', function () {{
+      syncNotes(form);
+    }});
+  }});
+
+  copyablePaths.forEach(function (node) {{
+    node.addEventListener('click', function () {{
+      const pathValue = node.getAttribute('data-copy-path') || '';
+      const labelValue = node.getAttribute('data-copy-label') || (node.textContent || '');
+      if (!pathValue || !navigator.clipboard || !navigator.clipboard.writeText) {{
         return;
       }}
-      form.submit();
-      return;
-    }}
-  }}
+      navigator.clipboard.writeText(pathValue).then(function () {{
+        node.textContent = 'Copied path';
+        window.setTimeout(function () {{
+          node.textContent = labelValue;
+        }}, 900);
+      }}).catch(function () {{
+        return;
+      }});
+    }});
+  }});
 
-  if ((event.key === 'r' || event.key === 'R') && !event.metaKey && !event.ctrlKey && !isTextInput) {{
-    const form = document.querySelector('form[data-action="reject"]');
-    if (form) {{
-      event.preventDefault();
-      form.submit();
-      return;
-    }}
-  }}
+  document.addEventListener('keydown', function (event) {{
+    const active = document.activeElement;
+    const activeTag = (active && active.tagName || '').toLowerCase();
+    const activeType = (active && active.type || '').toLowerCase();
+    const isTextInput = activeTag === 'textarea' || (activeTag === 'input' && !['hidden', 'checkbox', 'button', 'submit'].includes(activeType));
 
-  if (event.key === '0' && !isTextInput) {{
-    const form = document.querySelector('form[data-suggestion="true"]');
-    if (form) {{
-      const truthLabel = form.getAttribute('data-truth-label');
-      event.preventDefault();
-      if (truthLabel && submitResolvedLabel(truthLabel)) {{
+    if (/^[1-5]$/.test(event.key) && !isTextInput) {{
+      const button = document.querySelector('button[data-recent-index="' + event.key + '"]');
+      if (button) {{
+        event.preventDefault();
+        button.click();
         return;
       }}
-      form.submit();
+    }}
+
+    if (event.key === '0' && !isTextInput) {{
+      const button = document.querySelector('button[data-suggestion="true"]');
+      if (button) {{
+        event.preventDefault();
+        button.click();
+        return;
+      }}
+    }}
+
+    const actionKeys = {{
+      'r': 'reject',
+      'u': 'unsure',
+      'n': 'not_a_bird',
+      'c': 'bad_crop',
+      'd': 'duplicate',
+      'k': 'skip'
+    }};
+    const mappedAction = actionKeys[(event.key || '').toLowerCase()];
+    if (!isTextInput && mappedAction) {{
+      const form = document.querySelector('form[data-action="' + mappedAction + '"]');
+      if (form) {{
+        event.preventDefault();
+        syncNotes(form);
+        form.submit();
+        return;
+      }}
+    }}
+
+    if (!isTextInput && (event.key === 's' || event.key === 'S')) {{
+      const stress = document.getElementById('stress-toggle');
+      if (stress) {{
+        event.preventDefault();
+        stress.checked = !stress.checked;
+        return;
+      }}
+    }}
+
+    if (!isTextInput && (event.key === 't' || event.key === 'T') && textInput) {{
+      event.preventDefault();
+      textInput.focus();
+      textInput.select();
       return;
     }}
-  }}
 
-  if ((event.key === 't' || event.key === 'T') && !isTextInput) {{
-    const stress = document.getElementById('stress-toggle');
-    if (stress) {{
-      event.preventDefault();
-      stress.checked = !stress.checked;
+    if (!isTextInput && (event.key === 'p' || event.key === 'P')) {{
+      const link = document.querySelector('[data-nav="prev"]');
+      if (link) {{
+        event.preventDefault();
+        window.location = link.getAttribute('href');
+      }}
     }}
-  }}
-
-  if (!isTextInput && (event.key === 'k' || event.key === 'K')) {{
-    const form = document.querySelector('form[data-action="skip"]');
-    if (form) {{
-      event.preventDefault();
-      form.submit();
-    }}
-  }}
-
-  if (!isTextInput && (event.key === 'n' || event.key === 'N')) {{
-    const form = document.querySelector('form[data-action="not_a_bird"]');
-    if (form) {{
-      event.preventDefault();
-      form.submit();
-    }}
-  }}
-
-  if (!isTextInput && (event.key === 'f' || event.key === 'F') && textInput) {{
-    event.preventDefault();
-    textInput.focus();
-    textInput.select();
-  }}
-
-  if (!isTextInput && (event.key === 'p' || event.key === 'P')) {{
-    const link = document.querySelector('[data-nav="prev"]');
-    if (link) {{
-      event.preventDefault();
-      window.location = link.getAttribute('href');
-    }}
-  }}
+  }});
 }});
 </script>
 </body>
@@ -432,6 +734,10 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
     topup_runner: QueueTopUpRunner | None
     topup_coordinator: QueueTopUpCoordinator | None
     topup_low_watermark: int
+    _session_metrics_lock = threading.Lock()
+    _session_metrics: dict[str, dict[str, Any]] = {}
+    _draft_notes_lock = threading.Lock()
+    _draft_notes: dict[str, str] = {}
 
     @staticmethod
     def _workflow_type(scope: dict[str, Any] | None) -> str:
@@ -456,6 +762,142 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
         if cls._is_run_hybrid_review(scope):
             return {"save", "skip"}
         return {"save", "save_burst", "skip", "reject", "unsure", "not_a_bird", "bad_crop", "duplicate"}
+
+    @classmethod
+    def _record_completed_action(cls, scope_key: str) -> None:
+        now = monotonic()
+        with cls._session_metrics_lock:
+            metric = cls._session_metrics.setdefault(
+                scope_key,
+                {
+                    "last_action_at": None,
+                    "interval_total": 0.0,
+                    "interval_count": 0,
+                },
+            )
+            last_action = metric.get("last_action_at")
+            if last_action is not None:
+                metric["interval_total"] += max(0.0, now - float(last_action))
+                metric["interval_count"] += 1
+            metric["last_action_at"] = now
+
+    @classmethod
+    def _tempo_display(cls, scope_key: str) -> str:
+        with cls._session_metrics_lock:
+            metric = cls._session_metrics.get(scope_key)
+            if not metric or int(metric.get("interval_count") or 0) <= 0:
+                return "--.-s/img"
+            avg = float(metric["interval_total"]) / float(metric["interval_count"])
+        return f"{avg:.1f}s/img"
+
+    @classmethod
+    def _get_draft_note(cls, candidate_id: str) -> str:
+        with cls._draft_notes_lock:
+            return cls._draft_notes.get(candidate_id, "")
+
+    @classmethod
+    def _set_draft_note(cls, candidate_id: str, note: str) -> None:
+        with cls._draft_notes_lock:
+            if note:
+                cls._draft_notes[candidate_id] = note
+            else:
+                cls._draft_notes.pop(candidate_id, None)
+
+    @classmethod
+    def _clear_draft_note(cls, candidate_id: str) -> None:
+        with cls._draft_notes_lock:
+            cls._draft_notes.pop(candidate_id, None)
+
+    @staticmethod
+    def _scope_member_keys(scope: dict[str, Any] | None) -> tuple[str, ...]:
+        if scope is None:
+            return ()
+        scope_keys = scope.get("scope_keys")
+        if scope_keys:
+            return tuple(str(value) for value in scope_keys if value)
+        scope_key = scope.get("scope_key")
+        return (str(scope_key),) if scope_key else ()
+
+    @staticmethod
+    def _is_aggregate_scope(scope: dict[str, Any] | None) -> bool:
+        return bool(scope and scope.get("scope_kind") == "aggregate")
+
+    def _touch_scope(self, scope: dict[str, Any] | None) -> None:
+        if scope is None:
+            return
+        opened_at = _utc_now()
+        for member_scope_key in self._scope_member_keys(scope):
+            self.store.touch_scope(member_scope_key, opened_at)
+
+    @staticmethod
+    def _aggregate_scope_from_members(scopes: list[dict[str, Any]], *, catalog_path: str, trip_folder: str) -> dict[str, Any] | None:
+        resolved_catalog_path = str(Path(catalog_path).resolve())
+        resolved_trip_folder = str(Path(trip_folder).resolve())
+        member_scopes = [
+            scope for scope in scopes
+            if str(scope.get("catalog_path") or "") == resolved_catalog_path
+            and str(scope.get("trip_folder") or "").startswith(resolved_trip_folder.rstrip("/") + "/")
+        ]
+        if len(member_scopes) < 2:
+            return None
+
+        workflow_types = {str(scope.get("workflow_type") or WORKFLOW_DETECTOR_REVIEW) for scope in member_scopes}
+        workflow_type = member_scopes[0].get("workflow_type") if len(workflow_types) == 1 else WORKFLOW_DETECTOR_REVIEW
+        created_at = min(str(scope.get("created_at") or "") for scope in member_scopes)
+        last_opened_values = [str(scope.get("last_opened_at") or "") for scope in member_scopes if scope.get("last_opened_at")]
+        return {
+            "scope_key": _aggregate_scope_key(resolved_catalog_path, resolved_trip_folder),
+            "scope_keys": [str(scope["scope_key"]) for scope in member_scopes],
+            "scope_kind": "aggregate",
+            "scope_name": f"{member_scopes[0].get('catalog_name') or Path(resolved_catalog_path).stem} / {resolved_trip_folder}",
+            "catalog_name": member_scopes[0].get("catalog_name") or Path(resolved_catalog_path).stem,
+            "catalog_path": resolved_catalog_path,
+            "trip_folder": resolved_trip_folder,
+            "workflow_type": workflow_type,
+            "created_at": created_at,
+            "last_opened_at": max(last_opened_values) if last_opened_values else None,
+            "status": "aggregate",
+            "notes": f"Aggregates {len(member_scopes)} child scopes",
+            "image_count": sum(int(scope.get("image_count") or 0) for scope in member_scopes),
+            "candidate_count": sum(int(scope.get("candidate_count") or 0) for scope in member_scopes),
+            "unreviewed_image_count": sum(int(scope.get("unreviewed_image_count") or 0) for scope in member_scopes),
+            "unreviewed_count": sum(int(scope.get("unreviewed_count") or 0) for scope in member_scopes),
+            "reviewed_count": sum(int(scope.get("reviewed_count") or 0) for scope in member_scopes),
+            "member_scope_count": len(member_scopes),
+        }
+
+    @classmethod
+    def _aggregate_scopes(cls, scopes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        aggregates: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+
+        for scope in scopes:
+            trip_folder = str(scope.get("trip_folder") or "")
+            catalog_path = str(scope.get("catalog_path") or "")
+            if not trip_folder.startswith("/"):
+                continue
+            parent = str(Path(trip_folder).parent)
+            if parent == trip_folder:
+                continue
+            groups.setdefault((catalog_path, parent), []).append(scope)
+
+        for (catalog_path, parent), members in groups.items():
+            if len(members) < 2 or (catalog_path, parent) in seen:
+                continue
+            aggregate = cls._aggregate_scope_from_members(scopes, catalog_path=catalog_path, trip_folder=parent)
+            if aggregate is None:
+                continue
+            aggregates.append(aggregate)
+            seen.add((catalog_path, parent))
+
+        aggregates.sort(
+            key=lambda scope: (
+                str(scope.get("catalog_name") or ""),
+                str(scope.get("trip_folder") or ""),
+            )
+        )
+        return aggregates
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -489,7 +931,7 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
             self.send_header("Location", "/scopes")
             self.end_headers()
             return
-        self.store.touch_scope(scope["scope_key"], _utc_now())
+        self._touch_scope(scope)
         self._maybe_start_background_top_up(scope)
         candidate_id = params.get("id", [None])[0]
         error = params.get("error", [""])[0]
@@ -499,12 +941,17 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
         prefill_notes = params.get("notes", [""])[0]
         stress_reason = params.get("stress_reason", [""])[0]
 
-        queue = ReviewQueue(self.store, QueueFilters(scope_key=scope["scope_key"], review_status="unreviewed"))
+        member_scope_keys = self._scope_member_keys(scope)
+        queue = ReviewQueue(self.store, QueueFilters(scope_keys=member_scope_keys, review_status="unreviewed"))
         if candidate_id is None:
             next_candidate = queue.next_candidate()
             if next_candidate is None:
                 status = self._top_up_status()
-                if self.topup_runner is not None and self.topup_coordinator is not None:
+                if (
+                    not self._is_aggregate_scope(scope)
+                    and self.topup_runner is not None
+                    and self.topup_coordinator is not None
+                ):
                     if not status["running"]:
                         self.topup_coordinator.ensure_running(self.store, self.topup_runner, scope)
                         status = self._top_up_status()
@@ -532,13 +979,15 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
 
         image = self.store.get_image(candidate["image_id"]) or {}
         annotation = self.store.get_annotation(candidate_id)
+        if not prefill_notes:
+            prefill_notes = self._get_draft_note(candidate_id) or ((annotation or {}).get("notes") or "")
         recent = self.store.recent_labels(limit=5)
-        prev_candidate = self.store.previous_reviewed_candidate(candidate_id, scope_key=scope["scope_key"])
+        prev_candidate = self.store.previous_reviewed_candidate(candidate_id, scope_keys=member_scope_keys)
         burst_targets = self.store.burst_candidates(candidate_id, include_reviewed=False)
         burst_position = self.store.burst_position(candidate_id)
-        queue_position = self.store.queue_position(candidate_id, scope_key=scope["scope_key"], review_status="unreviewed")
-        unreviewed_candidates = self.store.count_candidates(scope_key=scope["scope_key"], review_status="unreviewed")
-        unreviewed_images = self.store.count_candidate_images(scope_key=scope["scope_key"], review_status="unreviewed")
+        queue_position = self.store.queue_position(candidate_id, scope_keys=member_scope_keys, review_status="unreviewed")
+        unreviewed_candidates = self.store.count_candidates(scope_keys=member_scope_keys, review_status="unreviewed")
+        unreviewed_images = self.store.count_candidate_images(scope_keys=member_scope_keys, review_status="unreviewed")
         suggestion = self._build_suggestion(candidate, image, scope)
         estimated_subject_box_size = self._estimated_subject_box_size(candidate, image)
 
@@ -574,11 +1023,12 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
             self.send_header("Location", "/scopes")
             self.end_headers()
             return
-        self.store.touch_scope(scope["scope_key"], _utc_now())
+        self._touch_scope(scope)
         self._maybe_start_background_top_up(scope)
-        queue = ReviewQueue(self.store, QueueFilters(scope_key=scope["scope_key"], review_status="unreviewed"))
+        member_scope_keys = self._scope_member_keys(scope)
+        queue = ReviewQueue(self.store, QueueFilters(scope_keys=member_scope_keys, review_status="unreviewed"))
         next_candidate = queue.next_candidate()
-        summary = self.store.summary_counts(scope_key=scope["scope_key"])
+        summary = self.store.summary_counts(scope_keys=member_scope_keys)
         body = self._render_summary(scope, summary, next_candidate["id"] if next_candidate else None, self._top_up_status())
         self._write_html("Review Summary", body)
 
@@ -604,7 +1054,8 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
                 )
                 self.topup_coordinator.ensure_running(self.store, self.topup_runner, None)
                 scopes = self.store.list_scopes()
-        body = self._render_scopes(scopes, self._top_up_status())
+        aggregate_scopes = self._aggregate_scopes(scopes)
+        body = self._render_scopes(scopes, aggregate_scopes, self._top_up_status())
         self._write_html("Review Scopes", body)
 
     def _top_up_status(self) -> dict[str, Any]:
@@ -621,6 +1072,8 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
         if self.topup_runner is None or self.topup_coordinator is None:
             return
         if scope is None:
+            return
+        if self._is_aggregate_scope(scope):
             return
         unreviewed = self.store.count_candidates(scope_key=scope["scope_key"], review_status="unreviewed")
         status = self._top_up_status()
@@ -644,6 +1097,19 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
             return
 
         try:
+            if action == "note":
+                annotation = self.store.get_annotation(candidate_id)
+                if annotation is not None:
+                    row = dict(annotation)
+                    row["candidate_id"] = candidate_id
+                    row["notes"] = notes
+                    row["annotated_at"] = row.get("annotated_at") or _utc_now()
+                    self.store.upsert_annotation(row)
+                self._set_draft_note(candidate_id, notes)
+                self.send_response(HTTPStatus.SEE_OTHER)
+                self.send_header("Location", f"/review?scope={_q(scope_key)}&id={html.escape(candidate_id)}")
+                self.end_headers()
+                return
             if action not in self._allowed_actions(scope):
                 raise ValueError(
                     f"Action '{action}' is not allowed for workflow "
@@ -651,6 +1117,7 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
                 )
             if action == "skip":
                 self.store.mark_candidate_skipped(candidate_id)
+                self._set_draft_note(candidate_id, notes)
             elif action in {"reject", "unsure", "not_a_bird", "bad_crop", "duplicate"}:
                 self.store.upsert_annotation(
                     {
@@ -666,6 +1133,7 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
                         "annotated_at": _utc_now(),
                     }
                 )
+                self._clear_draft_note(candidate_id)
             elif action == "save":
                 resolved = self._resolve_label(selected_truth_label, label_input)
                 candidate = self.store.get_candidate(candidate_id) or {}
@@ -678,6 +1146,7 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
                     stress = False
                 row = self._build_labeled_row(candidate_id, resolved, label_input or selected_truth_label, stress, notes)
                 self.store.upsert_annotation(row)
+                self._clear_draft_note(candidate_id)
             elif action == "save_burst":
                 resolved = self._resolve_label(selected_truth_label, label_input)
                 candidate = self.store.get_candidate(candidate_id) or {}
@@ -691,6 +1160,7 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
                 row = self._build_labeled_row(candidate_id, resolved, label_input or selected_truth_label, stress, notes)
                 self.store.upsert_annotation(row)
                 self.store.apply_annotation_to_burst(candidate_id, row)
+                self._clear_draft_note(candidate_id)
             else:
                 raise ValueError(f"Unsupported action '{action}'")
         except (UnknownLabelError, AmbiguousLabelError, ValueError) as e:
@@ -705,6 +1175,9 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if action in {"save", "save_burst", "skip", "reject", "unsure", "not_a_bird", "bad_crop", "duplicate"}:
+            self._record_completed_action(scope_key)
+
         self.send_response(HTTPStatus.SEE_OTHER)
         self.send_header("Location", f"/review?scope={_q(scope_key)}")
         self.end_headers()
@@ -712,7 +1185,7 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
     def _resolve_label(self, selected_truth_label: str, label_input: str) -> ResolvedLabel:
         if selected_truth_label:
             return self.resolver.resolve_recent_label(selected_truth_label)
-        return self.resolver.resolve_common_name(label_input)
+        return self.resolver.resolve_name(label_input)
 
     @staticmethod
     def _estimated_subject_box_size(candidate: dict[str, Any], image: dict[str, Any]) -> tuple[float, float] | None:
@@ -763,273 +1236,549 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
         prefill_notes: str,
         stress_reason: str,
     ) -> str:
-        is_run_hybrid_review = self._is_run_hybrid_review(scope)
         allow_stress = self._allows_stress(scope)
         allow_burst_apply = self._allows_burst_apply(scope)
         default_save_action = "save_burst" if allow_burst_apply and burst_target_count else "save"
-        default_save_label = "Save + Apply To Burst" if default_save_action == "save_burst" else "Save Label"
-        burst_label = ""
-        if burst_position is not None:
-            burst_label = f" ({burst_position[0]}/{burst_position[1]})"
-        recent_forms = []
-        for idx, row in enumerate(recent, start=1):
-            recent_forms.append(
-                f"""
-                <form method="post" action="/review" data-recent-index="{idx}" data-truth-label="{html.escape(row['truth_label'])}">
-                  <input type="hidden" name="scope_key" value="{html.escape(scope['scope_key'])}">
-                  <input type="hidden" name="candidate_id" value="{html.escape(candidate['id'])}">
-                  <input type="hidden" name="action" value="{default_save_action}">
-                  <input type="hidden" name="selected_truth_label" value="{html.escape(row['truth_label'])}">
-                  <input type="hidden" name="stress" value="0">
-                  <button type="submit">({idx}) {html.escape(row['truth_common_name'])}</button>
-                </form>
-                """
-            )
-
-        error_html = f"<div class='error'>{html.escape(error)}</div>" if error else ""
-        notes = html.escape(prefill_notes or (annotation or {}).get("notes", ""))
-        resolved_preview = ""
-        if annotation and annotation["annotation_status"] == "labeled":
-            resolved_preview = (
-                f"<div class='resolved'><strong>Current:</strong> "
-                f"{html.escape(annotation['truth_common_name'])} "
-                f"({html.escape(annotation['truth_sci_name'])})"
-                f"{' [stress]' if allow_stress and annotation['stress'] else ''}</div>"
-            )
-        selected_preview = ""
-        if prefill_label_input:
-            selected_preview = f"""
-            <div class="resolved">
-              <div><strong>Pending label</strong>: {html.escape(prefill_label_input)}</div>
-            </div>
-            """
-        suggestion_html = ""
-        if suggestion is not None:
-            suggestion_html = f"""
-            <div class="resolved">
-              <div><strong>Classifier suggestion</strong>: {html.escape(suggestion.truth_common_name)} ({html.escape(suggestion.truth_sci_name)}) {suggestion.confidence:.1%}</div>
-              <form method="post" action="/review" data-suggestion="true" data-truth-label="{html.escape(suggestion.truth_label)}" style="margin-top:8px;">
-                <input type="hidden" name="scope_key" value="{html.escape(scope['scope_key'])}">
-                <input type="hidden" name="candidate_id" value="{html.escape(candidate['id'])}">
-                <input type="hidden" name="action" value="{default_save_action}">
-                <input type="hidden" name="selected_truth_label" value="{html.escape(suggestion.truth_label)}">
-                <input type="hidden" name="stress" value="0">
-                <button type="submit">(0) Accept Suggestion</button>
-              </form>
-            </div>
-            """
-        elif suggestion_status:
-            suggestion_html = f"""
-            <div class="resolved">
-              <div><strong>Classifier suggestion unavailable</strong></div>
-              <div class="small">{html.escape(suggestion_status)}</div>
-            </div>
-            """
-        stress_reason_html = ""
-        if allow_stress and stress_reason:
-            stress_reason_html = f"""
-            <div class="resolved">
-              <div><strong>Stress suggested</strong></div>
-              <div class="small">{html.escape(stress_reason)}</div>
-            </div>
-            """
-        ebird_reference = self._build_ebird_reference(
-            annotation=annotation,
-            suggestion=suggestion,
-            selected_truth_label=prefill_selected_truth_label,
-        )
-        ebird_reference_html = ""
-        if ebird_reference is not None:
-            reference_image_html = ""
-            if ebird_reference.preview_image_url:
-                reference_image_html = (
-                    f'<div>'
-                    f'<img src="{html.escape(ebird_reference.preview_image_url)}" '
-                    f'alt="{html.escape(ebird_reference.truth_common_name)} Macaulay reference photo" '
-                    f'class="reference-thumb"></div>'
-                )
-            ebird_reference_html = f"""
-            <div class="resolved reference-card">
-              {reference_image_html or '<div class="small">Reference photo unavailable.</div>'}
-              <div>
-                <div><strong>eBird reference</strong>: {html.escape(ebird_reference.truth_common_name)} ({html.escape(ebird_reference.truth_sci_name)})</div>
-                <div class="small" style="margin-top:8px">Remote eBird / Macaulay reference only. This tool does not store or export the media.</div>
-                <div class="button-cluster">
-                <a href="{html.escape(ebird_reference.species_url)}" target="_blank" rel="noopener"><button type="button">Open eBird Species Page</button></a>
-                <a href="{html.escape(ebird_reference.macaulay_asset_url or ebird_reference.media_search_url)}" target="_blank" rel="noopener"><button type="button">Open Macaulay Reference</button></a>
-                </div>
-              </div>
-            </div>
-            """
-        estimated_size_html = ""
-        if estimated_subject_box_size is not None:
-            estimated_size_html = (
-                f"<div><strong>Estimated subject box size:</strong> "
-                f"{estimated_subject_box_size[0]:.1f} cm × {estimated_subject_box_size[1]:.1f} cm</div>"
-                "<div class='small'>Approximate, assuming the boxed subject is at the focus distance.</div>"
-            )
-
-        queue_position_value = html.escape(f"{queue_position[0]}/{queue_position[1]}" if queue_position else "n/a")
-        queue_depth_value = html.escape(f"{unreviewed_candidates} candidates")
-        burst_compact = html.escape(f"{burst_position[0]}/{burst_position[1]}") if burst_position else "n/a"
-        source_path = html.escape(str(image.get("source_image_path", "")))
-        source_path_obj = Path(str(image.get("source_image_path", ""))) if image.get("source_image_path") else None
-        source_name = source_path_obj.name if source_path_obj else ""
-        source_date = source_path_obj.parent.name if source_path_obj else ""
+        source_path = str(image.get("source_image_path", ""))
+        source_path_obj = Path(source_path) if source_path else None
         scope_path = str(scope.get("trip_folder") or "")
-        scope_leaf = Path(scope_path).name if scope_path else scope.get("scope_name", "")
+        scope_leaf = Path(scope_path).name if scope_path else str(scope.get("scope_name") or "")
         compact_scope = f"{scope.get('catalog_name') or ''} / {scope_leaf}".strip(" /")
-        compact_source = " / ".join(part for part in [scope_leaf, source_date, source_name] if part)
-        burst_help = (
-            "This candidate has "
-            + str(burst_target_count)
-            + " other safe burst item(s), so label actions default to burst apply."
-            if allow_burst_apply and burst_target_count
-            else "No safe burst targets available. Burst apply only includes other unreviewed, single-detection candidates in the same burst group."
-            if allow_burst_apply
-            else "This workflow labels one image at a time. Save applies only to the current image."
-        )
-        shortcut_help = (
-            "Type a common name or use a recent label button below. Shortcuts: 0, 1-5, R, T, K, N, P, F. Label accepts default to burst apply when eligible."
-            if not is_run_hybrid_review
-            else "Type a common name or use a recent label button below. Shortcuts: 0, 1-5, K, P, F."
-        )
-        stress_toggle_html = (
-            f"""<label class="toggle"><input id="stress-toggle" type="checkbox" name="stress" value="1" {'checked' if prefill_stress else ''}> (T) mark as stress</label>"""
-            if allow_stress
-            else ""
-        )
-        other_outcomes_html = (
-            f"""
-                  <div class="actions">
-                    <div><strong>Other outcomes</strong></div>
-                    {self._outcome_button(scope['scope_key'], candidate['id'], 'reject', '(R) Reject')}
-                    {self._outcome_button(scope['scope_key'], candidate['id'], 'unsure', 'Unsure')}
-                    {self._outcome_button(scope['scope_key'], candidate['id'], 'not_a_bird', '(N) Not a Bird')}
-                    {self._outcome_button(scope['scope_key'], candidate['id'], 'bad_crop', 'Bad Crop')}
-                    {self._outcome_button(scope['scope_key'], candidate['id'], 'duplicate', 'Duplicate')}
-                    {self._outcome_button(scope['scope_key'], candidate['id'], 'skip', '(K) Skip')}
-                  </div>
-            """
-            if not is_run_hybrid_review
-            else f"""
-                  <div class="actions">
-                    <div><strong>Skip</strong></div>
-                    {self._outcome_button(scope['scope_key'], candidate['id'], 'skip', '(K) Skip')}
-                  </div>
-            """
-        )
+        source_display_path = source_path or (str(source_path_obj) if source_path_obj else "")
+        tempo = self._tempo_display(scope["scope_key"])
+        progress = self._progress_metrics(queue_position)
+        notes = prefill_notes or (annotation or {}).get("notes", "")
+
+        context = {
+            "scope": scope,
+            "candidate": candidate,
+            "image": image,
+            "annotation": annotation,
+            "recent": recent,
+            "error": error,
+            "prev_candidate": prev_candidate,
+            "burst_target_count": burst_target_count,
+            "burst_position": burst_position,
+            "queue_position": queue_position,
+            "unreviewed_images": unreviewed_images,
+            "unreviewed_candidates": unreviewed_candidates,
+            "suggestion": suggestion,
+            "estimated_subject_box_size": estimated_subject_box_size,
+            "suggestion_status": suggestion_status,
+            "prefill_selected_truth_label": prefill_selected_truth_label,
+            "prefill_label_input": prefill_label_input,
+            "prefill_stress": prefill_stress,
+            "prefill_notes": notes,
+            "stress_reason": stress_reason,
+            "default_save_action": default_save_action,
+            "allow_stress": allow_stress,
+            "allow_burst_apply": allow_burst_apply,
+            "compact_scope": compact_scope,
+            "source_display_path": source_display_path,
+            "tempo": tempo,
+            "progress": progress,
+            "details_rows": self._build_details_rows(
+                scope=scope,
+                candidate=candidate,
+                image=image,
+                queue_position=queue_position,
+                unreviewed_images=unreviewed_images,
+                unreviewed_candidates=unreviewed_candidates,
+                burst_position=burst_position,
+                estimated_subject_box_size=estimated_subject_box_size,
+            ),
+            "ebird_reference": self._build_ebird_reference(
+                annotation=annotation,
+                suggestion=suggestion,
+                selected_truth_label=prefill_selected_truth_label,
+            ),
+        }
 
         return f"""
         <div class="page">
           <div class="app-shell">
-            <div class="topbar panel">
-              <h1>review_app</h1>
-              <div class="scope-pill" title="{html.escape(scope.get('scope_name') or '')}">
-                <span class="label">Scope</span>
-                <span class="value">{html.escape(compact_scope)}</span>
-              </div>
-              <div class="topbar-actions">
-                <div class="header-status">
-                  <span class="status-badge">Queue {queue_position_value}</span>
-                  <span class="status-badge">{queue_depth_value}</span>
-                </div>
-                <a href="/scopes"><button type="button">Scopes</button></a>
-                <a href="/summary?scope={_q(scope['scope_key'])}"><button type="button">Summary</button></a>
-              </div>
-            </div>
-
+            {self._render_top_bar(context)}
             <div class="wrap">
-              <div class="panel preview-panel">
-                <div class="preview-frame">
-                  <img class="candidate-preview" src="/preview/{html.escape(candidate['id'])}" alt="preview">
+              {self._render_outcome_rail(context)}
+              <div class="review-body">
+                <div class="photo-column">
+                  {self._render_photo_stage(context)}
+                  {self._render_classifier_banner(context)}
                 </div>
-                <div class="preview-controls">
-                  <form method="post" action="/review" data-role="review-form">
-                    <input type="hidden" name="scope_key" value="{html.escape(scope['scope_key'])}">
-                    <input type="hidden" name="candidate_id" value="{html.escape(candidate['id'])}">
-                    <input type="hidden" name="action" value="{default_save_action}">
-                    <input id="selected-truth-label" type="hidden" name="selected_truth_label" value="{html.escape(prefill_selected_truth_label)}">
-                    <div><strong>Manual label</strong></div>
-                    <div class="manual-label-row">
-                      <input class="manual-label-input" type="text" name="label_input" placeholder="Type common name" value="{html.escape(prefill_label_input)}">
-                        <div class="form-actions">
-                          <div class="form-actions-left">
-                            <button class="primary" type="submit">{default_save_label}</button>
-                            {f'<button type="submit" formaction="/review" formmethod="post" name="action" value="save">Save Current Only</button>' if allow_burst_apply and burst_target_count else ''}
-                          </div>
-                          {stress_toggle_html}
-                        </div>
-                    </div>
-                    <div class="small">{shortcut_help}</div>
-                  </form>
-                  <div class="recent">
-                    <div><strong>Recent labels</strong> <span class="small">(1-5)</span></div>
-                    {''.join(recent_forms) or '<div class="small">No recent labels yet.</div>'}
-                  </div>
-                  {other_outcomes_html}
-                </div>
-              </div>
-              <div class="panel">
-                <div class="right-stack">
-                  <div class="meta-strip" title="{source_path}">
-                    <div class="source-compact">{html.escape(compact_source or str(image.get('source_image_path', '')))}</div>
-                    <div class="burst-compact"><strong>Burst</strong> {burst_compact}</div>
-                  </div>
-                  {error_html}
-                  {resolved_preview}
-                  {selected_preview}
-                  {suggestion_html}
-                  {stress_reason_html}
-                  <div>
-                    {f'<a data-nav="prev" href="/review?scope={_q(scope["scope_key"])}&id={html.escape(prev_candidate["id"])}"><button type="button">(P) Previous Reviewed Candidate</button></a>' if prev_candidate else '<button type="button" disabled>(P) Previous Reviewed Candidate</button>'}
-                  </div>
-                  {ebird_reference_html}
-                  <details class="details-meta">
-                    <summary>
-                      <div class="details-summary-main">
-                        <span class="details-summary-title">Details</span>
-                        <span class="details-summary-value"><code>{source_path}</code></span>
-                      </div>
-                      <div class="details-summary-burst"><strong>Burst</strong> {burst_compact}</div>
-                    </summary>
-                    <div class="details-body meta">
-                      <div class="details-grid">
-                        <div><strong>Scope:</strong> {html.escape(scope.get('scope_name', ''))}</div>
-                        <div><strong>Candidate:</strong> <code>{html.escape(candidate['id'])}</code></div>
-                        <div><strong>Captured:</strong> {html.escape(str(image.get('capture_datetime', '')))}</div>
-                        <div><strong>Detector:</strong> {html.escape(str(candidate.get('detector_name', '')))} @ {candidate.get('detector_confidence', 0):.2f}</div>
-                        <div><strong>Region:</strong> {html.escape(str(image.get('region_hint', '')))}</div>
-                        <div><strong>Burst Group:</strong> {html.escape(str(image.get('burst_group_id', '')))}{html.escape(burst_label)}</div>
-                        <div><strong>Queue Depth:</strong> {unreviewed_images} image(s), {unreviewed_candidates} candidate(s) yolo'd and waiting</div>
-                        {estimated_size_html}
-                        <div class="small">{html.escape(burst_help)}</div>
-                      </div>
-                    </div>
-                  </details>
-                  <form method="post" action="/review" style="margin-top:6px">
-                    <input type="hidden" name="scope_key" value="{html.escape(scope['scope_key'])}">
-                    <input type="hidden" name="candidate_id" value="{html.escape(candidate['id'])}">
-                    <input type="hidden" name="action" value="save">
-                    <input type="hidden" name="selected_truth_label" value="">
-                    <div><strong>Notes</strong></div>
-                    <input type="text" name="notes" value="{notes}" placeholder="Optional note">
-                  </form>
+                <div class="inspector-column">
+                  {self._render_inspector(context)}
                 </div>
               </div>
             </div>
+            {self._render_bottom_bar(context)}
           </div>
         </div>
         """
 
     @staticmethod
-    def _outcome_button(scope_key: str, candidate_id: str, action: str, label: str) -> str:
+    def _workflow_presentation(scope: dict[str, Any]) -> dict[str, Any]:
+        if ReviewAppHandler._is_run_hybrid_review(scope):
+            return {
+                "app_name": "review_run",
+                "shortcut_copy": "Shortcuts: 0 accept suggestion, 1-5 recent labels, T text input, K skip, P previous.",
+                "rail_actions": [
+                    {
+                        "action": "save",
+                        "label": "Accept",
+                        "key": "0",
+                        "variant": "accept",
+                        "mode": "suggestion",
+                    },
+                    {
+                        "action": "skip",
+                        "label": "Skip",
+                        "key": "K",
+                        "variant": "neutral",
+                    },
+                ],
+            }
+        return {
+            "app_name": "review_app",
+            "shortcut_copy": "Shortcuts: 0 accept suggestion, 1-5 recent labels, T text input, S stress, R reject, U unsure, N not a bird, C bad crop, D duplicate, K skip, P previous.",
+            "rail_actions": [
+                {
+                    "action": "save",
+                    "label": "Accept",
+                    "key": "0",
+                    "variant": "accept",
+                    "mode": "suggestion",
+                },
+                {"action": "reject", "label": "Reject", "key": "R", "variant": "danger"},
+                {"action": "unsure", "label": "Unsure", "key": "U", "variant": "neutral"},
+                {"action": "not_a_bird", "label": "Not A Bird", "key": "N", "variant": "danger"},
+                {"action": "bad_crop", "label": "Bad Crop", "key": "C", "variant": "neutral"},
+                {"action": "duplicate", "label": "Duplicate", "key": "D", "variant": "neutral"},
+                {"action": "skip", "label": "Skip", "key": "K", "variant": "neutral"},
+            ],
+        }
+
+    @staticmethod
+    def _progress_metrics(queue_position: tuple[int, int] | None) -> dict[str, Any]:
+        if not queue_position or queue_position[1] <= 0:
+            return {"current": 0, "total": 0, "fraction": 0.0, "label": "0 / 0"}
+        current, total = queue_position
+        current = max(1, int(current))
+        total = max(current, int(total))
+        return {
+            "current": current,
+            "total": total,
+            "fraction": current / total,
+            "label": f"{current} / {total}",
+        }
+
+    def _render_top_bar(self, context: dict[str, Any]) -> str:
+        scope = context["scope"]
+        progress = context["progress"]
+        source_path = str(context["image"].get("source_image_path") or "")
+        backlog_images = int(context["unreviewed_images"] or 0)
+        backlog_candidates = int(context["unreviewed_candidates"] or 0)
         return f"""
-        <form method="post" action="/review" data-action="{html.escape(action)}">
+        <div class="topbar">
+          <div class="topbar-left">
+            <h1>{html.escape(self._workflow_presentation(scope)["app_name"])}</h1>
+            <div class="divider"></div>
+            <div class="topbar-stanza">
+              <div class="mono-label">Scope</div>
+              <div class="topbar-value">{html.escape(context["compact_scope"] or str(scope.get("scope_name") or ""))}</div>
+            </div>
+            <div class="topbar-stanza copyable-path" title="Click to copy full path" data-copy-path="{html.escape(source_path)}" data-copy-label="{html.escape(context['source_display_path'] or 'Unknown file')}">
+              <div class="mono-label">Image</div>
+              <div class="topbar-value">{html.escape(context["source_display_path"] or "Unknown file")}</div>
+            </div>
+          </div>
+          <div class="topbar-right">
+            <div class="topbar-stanza">
+              <div class="mono-label">Queue</div>
+              <div class="progress-numbers"><strong>{html.escape(progress["label"])}</strong> image queue</div>
+            </div>
+            <div class="topbar-stanza">
+              <div class="mono-label">Backlog</div>
+              <div class="progress-numbers"><strong>{backlog_images}</strong> images / <strong>{backlog_candidates}</strong> candidates</div>
+            </div>
+            <div class="progress-track"><div class="progress-fill" style="width:{progress['fraction'] * 100:.1f}%"></div></div>
+            <div class="topbar-stanza">
+              <div class="mono-label">Tempo</div>
+              <div class="progress-numbers">{html.escape(context["tempo"])}</div>
+            </div>
+            <div class="topbar-actions">
+              <a class="btn" href="/scopes">Scopes</a>
+              <a class="btn" href="/summary?scope={_q(scope['scope_key'])}">Summary</a>
+            </div>
+          </div>
+        </div>
+        """
+
+    def _render_outcome_rail(self, context: dict[str, Any]) -> str:
+        scope = context["scope"]
+        suggestion = context["suggestion"]
+        default_save_action = context["default_save_action"]
+        rail = []
+        for item in self._workflow_presentation(scope)["rail_actions"]:
+            label = item["label"]
+            key = item["key"]
+            variant = item["variant"]
+            mode = item.get("mode")
+            if mode == "suggestion" and suggestion is None:
+                rail.append(
+                    f"""
+                    <div class="rail-tile accept" aria-disabled="true">
+                      <span class="keycap keycap-accent">{html.escape(key)}</span>
+                      <span class="rail-tile-label">{html.escape(label)}</span>
+                    </div>
+                    """
+                )
+                continue
+            if mode == "suggestion":
+                rail.append(
+                    f"""
+                    <form method="post" action="/review" data-suggestion="true" class="rail-form">
+                      <input type="hidden" name="scope_key" value="{html.escape(scope['scope_key'])}">
+                      <input type="hidden" name="candidate_id" value="{html.escape(context['candidate']['id'])}">
+                      <input type="hidden" name="action" value="{html.escape(default_save_action)}">
+                      <input type="hidden" name="selected_truth_label" value="{html.escape(suggestion.truth_label)}">
+                      <input type="hidden" name="stress" value="0">
+                      <input type="hidden" name="notes" value="">
+                      <button type="submit" class="rail-tile accept" data-suggestion="true" data-resolved-label="1" data-truth-label="{html.escape(suggestion.truth_label)}" data-submit-action="{html.escape(default_save_action)}">
+                        <span class="keycap keycap-accent">{html.escape(key)}</span>
+                        <span class="rail-tile-label">{html.escape(label)}</span>
+                      </button>
+                    </form>
+                    """
+                )
+                continue
+            rail.append(
+                self._outcome_button(
+                    scope["scope_key"],
+                    context["candidate"]["id"],
+                    item["action"],
+                    item["label"],
+                    key_hint=key,
+                    variant=variant,
+                )
+            )
+
+        previous_link = (
+            f'<a class="rail-tile" data-nav="prev" href="/review?scope={_q(scope["scope_key"])}&id={html.escape(context["prev_candidate"]["id"])}">'
+            f'<span class="keycap">P</span><span class="rail-tile-label">Previous</span></a>'
+            if context["prev_candidate"]
+            else '<div class="rail-tile" aria-disabled="true"><span class="keycap">P</span><span class="rail-tile-label">Previous</span></div>'
+        )
+        return f"""
+        <div class="rail">
+          {''.join(rail)}
+          <div class="rail-fill"></div>
+          {previous_link}
+        </div>
+        """
+
+    def _render_photo_stage(self, context: dict[str, Any]) -> str:
+        candidate = context["candidate"]
+        return f"""
+        <div class="panel" style="flex:1; display:flex; flex-direction:column; min-height:0;">
+          <div class="stage-header">
+            <div>
+              <div class="mono-label">Photo Stage</div>
+              <div class="small">{html.escape(self._workflow_presentation(context["scope"])["shortcut_copy"])}</div>
+            </div>
+            <div class="stage-header-controls">
+              <button type="button">Fit</button>
+              <button type="button">100%</button>
+            </div>
+          </div>
+          <div class="photo-frame">
+            <img class="candidate-preview" src="/preview/{html.escape(candidate['id'])}" alt="candidate preview">
+          </div>
+        </div>
+        """
+
+    def _render_classifier_banner(self, context: dict[str, Any]) -> str:
+        suggestion = context["suggestion"]
+        suggestion_status = context["suggestion_status"]
+        scope = context["scope"]
+        default_save_action = context["default_save_action"]
+        annotation = context["annotation"]
+        selected = context["prefill_label_input"]
+        stress_reason = context["stress_reason"]
+
+        current_html = ""
+        if annotation and annotation.get("annotation_status") == "labeled":
+            current_html = (
+                f'<div class="mono-small">Current: '
+                f'{html.escape(annotation.get("truth_common_name") or "")}'
+                f'{(" [stress]" if context["allow_stress"] and annotation.get("stress") else "")}</div>'
+            )
+        elif selected:
+            current_html = f'<div class="mono-small">Pending text: {html.escape(selected)}</div>'
+
+        if suggestion is None:
+            details = html.escape(suggestion_status or "No classifier suggestion is available for this candidate.")
+            extra = (
+                f'<div class="mono-small">Stress hint: {html.escape(stress_reason)}</div>'
+                if context["allow_stress"] and stress_reason
+                else ""
+            )
+            return f"""
+            <div class="classifier-banner">
+              <div class="classifier-status"><span class="status-dot"></span><span class="mono-label">Classifier</span></div>
+              <div class="classifier-main">
+                <div class="classifier-fallback">Suggestion unavailable</div>
+                <div class="mono-small">{details}</div>
+                {current_html}
+                {extra}
+              </div>
+            </div>
+            """
+
+        accept_label = "Accept Suggestion"
+        if self._allows_burst_apply(scope) and context["burst_target_count"]:
+            accept_label = "Accept + Burst"
+        stress_html = (
+            f'<div class="mono-small">Stress suggested: {html.escape(stress_reason)}</div>'
+            if context["allow_stress"] and stress_reason
+            else ""
+        )
+        return f"""
+        <div class="classifier-banner">
+          <div class="classifier-status">
+            <span class="status-dot"></span>
+            <span class="keycap keycap-accent">0</span>
+          </div>
+          <div class="classifier-main">
+            <div class="classifier-name">{html.escape(suggestion.truth_common_name)}</div>
+            <div class="classifier-sci">{html.escape(suggestion.truth_sci_name)}</div>
+            <div class="classifier-meta">
+              <div class="classifier-confidence"><div class="classifier-confidence-fill" style="width:{suggestion.confidence * 100:.1f}%"></div></div>
+              <div class="classifier-confidence-value">{suggestion.confidence:.0%}</div>
+            </div>
+            {current_html}
+            {stress_html}
+          </div>
+          <form method="post" action="/review" data-suggestion="true">
+            <input type="hidden" name="scope_key" value="{html.escape(scope['scope_key'])}">
+            <input type="hidden" name="candidate_id" value="{html.escape(context['candidate']['id'])}">
+            <input type="hidden" name="action" value="{html.escape(default_save_action)}">
+            <input type="hidden" name="selected_truth_label" value="{html.escape(suggestion.truth_label)}">
+            <input type="hidden" name="stress" value="0">
+            <input type="hidden" name="notes" value="">
+            <button type="submit" class="primary" data-suggestion="true" data-resolved-label="1" data-truth-label="{html.escape(suggestion.truth_label)}" data-submit-action="{html.escape(default_save_action)}">{html.escape(accept_label)}</button>
+          </form>
+        </div>
+        """
+
+    def _render_inspector(self, context: dict[str, Any]) -> str:
+        ebird_reference = context["ebird_reference"]
+        error = context["error"]
+        details_rows = context["details_rows"]
+        notes = html.escape(context["prefill_notes"])
+        source_path = str(context["image"].get("source_image_path") or "")
+
+        error_html = f"<div class='error'>{html.escape(error)}</div>" if error else ""
+        reference_html = ""
+        if ebird_reference is not None:
+            thumb = (
+                f'<div class="reference-thumb"><img src="{html.escape(ebird_reference.preview_image_url)}" alt="{html.escape(ebird_reference.truth_common_name)} reference"></div>'
+                if ebird_reference.preview_image_url
+                else '<div class="reference-thumb"><div class="small">Reference photo unavailable.</div></div>'
+            )
+            reference_html = f"""
+            <div class="panel inspector-card">
+              <div class="inspector-header">
+                <div>
+                  <div class="mono-label">eBird Reference</div>
+                  <div>{html.escape(ebird_reference.truth_common_name)}</div>
+                </div>
+              </div>
+              {thumb}
+              <div class="small"><em>{html.escape(ebird_reference.truth_sci_name)}</em></div>
+              <div class="reference-actions">
+                <a class="btn" href="{html.escape(ebird_reference.species_url)}" target="_blank" rel="noopener">Open eBird</a>
+                <a class="btn" href="{html.escape(ebird_reference.macaulay_asset_url or ebird_reference.media_search_url)}" target="_blank" rel="noopener">Open Macaulay</a>
+              </div>
+            </div>
+            """
+
+        details_html = "".join(
+            f"""
+            <div class="detail-item">
+              <div class="mono-label">{html.escape(label)}</div>
+              <div class="detail-value">{html.escape(value)}</div>
+            </div>
+            """
+            for label, value in details_rows
+        ) or '<div class="small">No extra metadata available for this image.</div>'
+
+        note_form = f"""
+        <div class="panel inspector-card">
+          <div class="mono-label">Notes</div>
+          <form method="post" action="/review">
+            <input type="hidden" name="scope_key" value="{html.escape(context['scope']['scope_key'])}">
+            <input type="hidden" name="candidate_id" value="{html.escape(context['candidate']['id'])}">
+            <input type="hidden" name="action" value="note">
+            <input type="hidden" name="selected_truth_label" value="">
+            <input type="hidden" name="notes" value="">
+            <input id="note-input" class="note-input" type="text" value="{notes}" placeholder="Optional note">
+            <div class="reference-actions" style="margin-top:8px;">
+              <button type="submit">Save Note</button>
+            </div>
+          </form>
+          <div class="path-text copyable-path" title="Click to copy full path" data-copy-path="{html.escape(source_path)}" data-copy-label="{html.escape(source_path)}">{html.escape(source_path)}</div>
+        </div>
+        """
+
+        return f"""
+        {error_html}
+        {reference_html}
+        <div class="panel inspector-card">
+          <div class="inspector-header">
+            <div>
+              <div class="mono-label">Details</div>
+              <div class="small">Available image metadata only.</div>
+            </div>
+          </div>
+          <div class="details-grid">{details_html}</div>
+        </div>
+        {note_form}
+        """
+
+    def _render_bottom_bar(self, context: dict[str, Any]) -> str:
+        scope = context["scope"]
+        recent = context["recent"]
+        default_save_action = context["default_save_action"]
+        prefill_label_input = context["prefill_label_input"]
+        stress_checked = "checked" if context["prefill_stress"] else ""
+        recent_html = []
+        for idx, row in enumerate(recent, start=1):
+            recent_html.append(
+                f"""
+                <form method="post" action="/review">
+                  <input type="hidden" name="scope_key" value="{html.escape(scope['scope_key'])}">
+                  <input type="hidden" name="candidate_id" value="{html.escape(context['candidate']['id'])}">
+                  <input type="hidden" name="action" value="{html.escape(default_save_action)}">
+                  <input type="hidden" name="selected_truth_label" value="{html.escape(row['truth_label'])}">
+                  <input type="hidden" name="stress" value="0">
+                  <input type="hidden" name="notes" value="">
+                  <button type="submit" class="recent-btn" data-recent-index="{idx}">
+                    <span class="keycap">{idx}</span>
+                    <span class="label-text">{html.escape(row['truth_common_name'])}</span>
+                  </button>
+                </form>
+                """
+            )
+
+        stress_chip = (
+            f"""
+            <label class="stress-chip">
+              <input id="stress-toggle" type="checkbox" name="stress" value="1" {stress_checked}>
+              <span class="keycap">S</span>
+              <span>Stress</span>
+            </label>
+            """
+            if context["allow_stress"]
+            else ""
+        )
+
+        return f"""
+        <div class="bottom-bar">
+          <form id="review-form" method="post" action="/review" style="display:flex; align-items:center; gap:12px; flex:1; min-width:0;">
+            <input type="hidden" name="scope_key" value="{html.escape(scope['scope_key'])}">
+            <input type="hidden" name="candidate_id" value="{html.escape(context['candidate']['id'])}">
+            <input id="review-action" type="hidden" name="action" value="{html.escape(default_save_action)}">
+            <input id="selected-truth-label" type="hidden" name="selected_truth_label" value="{html.escape(context['prefill_selected_truth_label'])}">
+            <input type="hidden" name="notes" value="">
+            <div class="manual-label-wrap">
+              <input class="manual-label-input" type="text" name="label_input" value="{html.escape(prefill_label_input)}" placeholder="Type common or scientific name (T)">
+            </div>
+            <button class="primary" type="submit">Save Label</button>
+            <div class="recent-strip">
+              {''.join(recent_html) or '<div class="small">No recent labels yet.</div>'}
+            </div>
+            {stress_chip}
+          </form>
+        </div>
+        """
+
+    @staticmethod
+    def _build_details_rows(
+        *,
+        scope: dict[str, Any],
+        candidate: dict[str, Any],
+        image: dict[str, Any],
+        queue_position: tuple[int, int] | None,
+        unreviewed_images: int,
+        unreviewed_candidates: int,
+        burst_position: tuple[int, int] | None,
+        estimated_subject_box_size: tuple[float, float] | None,
+    ) -> list[tuple[str, str]]:
+        rows: list[tuple[str, str]] = []
+        image_path = image.get("source_image_path")
+        metadata: dict[str, Any] = {}
+        if image_path:
+            try:
+                metadata = load_subject_size_metadata(image_path)
+            except Exception:
+                metadata = {}
+
+        def add(label: str, value: Any) -> None:
+            if value is None:
+                return
+            text = str(value).strip()
+            if text:
+                rows.append((label, text))
+
+        add("Scope", scope.get("scope_name"))
+        add("Candidate", candidate.get("id"))
+        add("Captured", image.get("capture_datetime"))
+        add("Lens", image.get("lens_model"))
+        focal_length = image.get("focal_length")
+        if focal_length not in {None, ""}:
+            add("Focal Length", f"{float(focal_length):.0f} mm")
+        add("Rating", image.get("rating"))
+        add("Region", image.get("region_hint"))
+        if queue_position:
+            add("Queue", f"{queue_position[0]} / {queue_position[1]}")
+        add("Unreviewed", f"{unreviewed_images} image(s), {unreviewed_candidates} candidate(s)")
+        if burst_position:
+            add("Burst", f"{burst_position[0]} / {burst_position[1]}")
+        add("Burst Group", image.get("burst_group_id"))
+        add("Detector", candidate.get("detector_name"))
+        if candidate.get("detector_confidence") is not None:
+            add("Confidence", f"{float(candidate['detector_confidence']):.0%}")
+        if metadata.get("focus_distance_m") is not None:
+            add("Focus Dist.", f"{float(metadata['focus_distance_m']):.2f} m")
+        if metadata.get("focal_length_35mm_mm") is not None:
+            add("35mm Eq.", f"{float(metadata['focal_length_35mm_mm']):.0f} mm")
+        if estimated_subject_box_size is not None:
+            add(
+                "Box Size",
+                f"{estimated_subject_box_size[0]:.1f} cm × {estimated_subject_box_size[1]:.1f} cm",
+            )
+        return rows
+
+    @staticmethod
+    def _outcome_button(
+        scope_key: str,
+        candidate_id: str,
+        action: str,
+        label: str,
+        *,
+        key_hint: str | None = None,
+        variant: str = "neutral",
+    ) -> str:
+        variant_class = " accept" if variant == "accept" else " danger" if variant == "danger" else ""
+        keycap_class = " keycap-danger" if variant == "danger" else " keycap-accent" if variant == "accept" else ""
+        keycap = f'<span class="keycap{keycap_class}">{html.escape(key_hint)}</span>' if key_hint else ""
+        return f"""
+        <form method="post" action="/review" data-action="{html.escape(action)}" class="rail-form">
           <input type="hidden" name="scope_key" value="{html.escape(scope_key)}">
           <input type="hidden" name="candidate_id" value="{html.escape(candidate_id)}">
           <input type="hidden" name="action" value="{html.escape(action)}">
-          <button type="submit">{html.escape(label)}</button>
+          <input type="hidden" name="notes" value="">
+          <button type="submit" class="rail-tile{variant_class}">{keycap}<span class="rail-tile-label">{html.escape(label)}</span></button>
         </form>
         """
 
@@ -1206,12 +1955,12 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
         )
 
     @staticmethod
-    def _render_scopes(scopes: list[dict[str, Any]], topup_status: dict[str, Any]) -> str:
+    def _render_scope_table(scopes: list[dict[str, Any]], *, aggregate: bool = False) -> str:
         rows = "".join(
             f"""
             <tr>
               <td><strong>{html.escape(scope['scope_name'])}</strong><div class="small">{html.escape(scope['catalog_path'])}</div></td>
-              <td>{html.escape(scope['trip_folder'])}</td>
+              <td>{html.escape(scope['trip_folder'])}{f'<div class="small">{int(scope.get("member_scope_count") or 0)} child scopes</div>' if aggregate else ''}</td>
               <td>{scope.get('unreviewed_count') or 0}</td>
               <td>{scope.get('reviewed_count') or 0}</td>
               <td>{scope.get('candidate_count') or 0}</td>
@@ -1220,6 +1969,17 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
             """
             for scope in scopes
         )
+        return rows
+
+    @classmethod
+    def _render_scopes(
+        cls,
+        scopes: list[dict[str, Any]],
+        aggregate_scopes: list[dict[str, Any]],
+        topup_status: dict[str, Any],
+    ) -> str:
+        aggregate_rows = cls._render_scope_table(aggregate_scopes, aggregate=True)
+        rows = cls._render_scope_table(scopes)
         status = ""
         if topup_status["running"]:
             status = "<div class='resolved'><div><strong>Background extraction running</strong></div></div>"
@@ -1227,10 +1987,18 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
         <div class="wrap">
           <div class="panel full">
             <h2>Review Scopes</h2>
-            <div class="small">Switch between persisted review scopes without restarting the app.</div>
+            <div class="small">Switch between persisted review scopes without restarting the app. Aggregate scopes combine sibling subfolders into one review queue.</div>
             {status}
           </div>
           <div class="panel full">
+            <h3>Aggregate Scopes</h3>
+            <table>
+              <thead><tr><th>Scope</th><th>Parent Folder</th><th>Unreviewed</th><th>Reviewed</th><th>Candidates</th><th></th></tr></thead>
+              <tbody>{aggregate_rows or '<tr><td colspan="6" class="small">No aggregate parent scopes available yet.</td></tr>'}</tbody>
+            </table>
+          </div>
+          <div class="panel full">
+            <h3>Persisted Scopes</h3>
             <table>
               <thead><tr><th>Scope</th><th>Trip Folder</th><th>Unreviewed</th><th>Reviewed</th><th>Candidates</th><th></th></tr></thead>
               <tbody>{rows or '<tr><td colspan="6" class="small">No scopes yet. If automatic top-up is configured, wait for the first batch to populate.</td></tr>'}</tbody>
@@ -1361,6 +2129,13 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
         if not scopes:
             return None
         if scope_key:
+            aggregate_payload = _parse_aggregate_scope_key(scope_key)
+            if aggregate_payload is not None:
+                return self._aggregate_scope_from_members(
+                    scopes,
+                    catalog_path=aggregate_payload["catalog_path"],
+                    trip_folder=aggregate_payload["trip_folder"],
+                )
             return self.store.get_scope(scope_key)
         if len(scopes) == 1:
             return scopes[0]
@@ -1404,7 +2179,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min-stars", type=int, default=None, help="Optional minimum Lightroom rating for automatic top-up")
     p.add_argument(
         "--formats",
-        default="RAW,DNG,JPEG,TIFF,PSD",
+        default="RAW,DNG,JPEG,JPG,TIFF,PSD",
         help="Comma-separated Lightroom file formats to scan during automatic top-up; accepts arbitrary Lightroom fileFormat values",
     )
     p.add_argument("--max-preview-dimension", type=int, default=2048)

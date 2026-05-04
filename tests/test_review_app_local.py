@@ -127,12 +127,126 @@ class ReviewAppTest(unittest.TestCase):
             prefill_notes="",
             stress_reason="",
         )
-        self.assertIn("Save Label", html)
+        self.assertIn("review_run", html)
+        self.assertIn("Photo Stage", html)
+        self.assertIn("Accept Suggestion", html)
         self.assertIn("Skip", html)
-        self.assertNotIn("mark as stress", html)
+        self.assertIn("Type species common name (T)", html)
+        self.assertIn("Backlog", html)
+        self.assertIn("images / <strong>4</strong> candidates", html)
+        self.assertNotIn("Stress", html)
         self.assertNotIn("Reject", html)
         self.assertNotIn("Not a Bird", html)
-        self.assertNotIn("Save + Apply To Burst", html)
+        self.assertNotIn("Not A Bird", html)
+        self.assertNotIn("Accept + Burst", html)
+        self.assertIn("data-copy-path=", html)
+
+    def test_render_candidate_shows_expert_actions_and_updated_shortcuts(self) -> None:
+        handler = object.__new__(ReviewAppHandler)
+        scope = {
+            "scope_key": "scope_detector",
+            "scope_name": "Catalog / Detector",
+            "catalog_name": "Catalog",
+            "trip_folder": "/photos/Detector",
+            "workflow_type": "detector_review",
+        }
+        candidate = {
+            "id": "cand_123",
+            "detector_name": "owlvit",
+            "detector_confidence": 0.42,
+        }
+        image = {
+            "source_image_path": "/photos/Detector/IMG_0002.ARW",
+            "capture_datetime": "2026-04-29T11:00:00Z",
+            "region_hint": "north_america",
+            "burst_group_id": "burst-22",
+            "lens_model": "FE 200-600mm",
+            "focal_length": 600.0,
+            "rating": 5,
+        }
+        html = handler._render_candidate(
+            scope,
+            candidate,
+            image,
+            annotation=None,
+            recent=[],
+            error="",
+            prev_candidate=None,
+            burst_target_count=0,
+            burst_position=(1, 3),
+            queue_position=(2, 5),
+            unreviewed_images=5,
+            unreviewed_candidates=6,
+            suggestion=SuggestedLabel(
+                truth_common_name="Great Blue Heron",
+                truth_sci_name="Ardea herodias",
+                truth_label="00999_label",
+                confidence=0.42,
+            ),
+            estimated_subject_box_size=(41.2, 28.8),
+            suggestion_status=None,
+            prefill_selected_truth_label="",
+            prefill_label_input="",
+            prefill_stress=False,
+            prefill_notes="",
+            stress_reason="Classifier confidence is low (42.0%).",
+        )
+        self.assertIn("review_app", html)
+        self.assertIn("Reject", html)
+        self.assertIn("Unsure", html)
+        self.assertIn("Not A Bird", html)
+        self.assertIn(">S<", html)
+        self.assertIn("Type species common name (T)", html)
+        self.assertIn("Stress suggested", html)
+        self.assertIn("Box Size", html)
+
+    def test_render_candidate_shows_unavailable_suggestion_and_partial_details(self) -> None:
+        handler = object.__new__(ReviewAppHandler)
+        scope = {
+            "scope_key": "scope_detector",
+            "scope_name": "Catalog / Detector",
+            "catalog_name": "Catalog",
+            "trip_folder": "/photos/Detector",
+            "workflow_type": "detector_review",
+        }
+        candidate = {
+            "id": "cand_999",
+            "detector_name": "owlvit",
+            "detector_confidence": 0.17,
+        }
+        image = {
+            "source_image_path": "/photos/Detector/IMG_9999.ARW",
+            "capture_datetime": "2026-04-29T11:00:00Z",
+            "region_hint": "",
+        }
+        with patch("src.review_app.load_subject_size_metadata", return_value={"focus_distance_m": 12.34}):
+            html = handler._render_candidate(
+                scope,
+                candidate,
+                image,
+                annotation=None,
+                recent=[],
+                error="",
+                prev_candidate=None,
+                burst_target_count=0,
+                burst_position=None,
+                queue_position=(1, 1),
+                unreviewed_images=1,
+                unreviewed_candidates=1,
+                suggestion=None,
+                estimated_subject_box_size=None,
+                suggestion_status="classifier unavailable",
+                prefill_selected_truth_label="",
+                prefill_label_input="Killdeer",
+                prefill_stress=False,
+                prefill_notes="watch later",
+                stress_reason="",
+            )
+        self.assertIn("Suggestion unavailable", html)
+        self.assertIn("classifier unavailable", html)
+        self.assertIn("Focus Dist.", html)
+        self.assertNotIn("35mm Eq.", html)
+        self.assertIn("watch later", html)
 
     def test_render_summary_simplifies_run_hybrid_review_columns(self) -> None:
         scope = {"scope_key": "scope_hybrid", "scope_name": "Catalog / Hybrid", "workflow_type": "run_hybrid_review"}
@@ -154,6 +268,51 @@ class ReviewAppTest(unittest.TestCase):
         self.assertNotIn("<th>Stress</th>", html)
         self.assertNotIn("Reject", html)
         self.assertIn("Bald Eagle", html)
+
+    def test_render_candidate_mentions_common_or_scientific_name(self) -> None:
+        handler = object.__new__(ReviewAppHandler)
+        scope = {
+            "scope_key": "scope_default",
+            "scope_name": "Catalog / Scope",
+            "catalog_name": "Catalog",
+            "trip_folder": "/photos/Scope",
+            "workflow_type": "detector_review",
+        }
+        candidate = {
+            "id": "img_123",
+            "detector_name": "seeded",
+            "detector_confidence": 0.61,
+        }
+        image = {
+            "source_image_path": "/photos/Scope/IMG_0001.ARW",
+            "capture_datetime": "2026-04-29T10:00:00Z",
+            "region_hint": "north_america",
+            "burst_group_id": "",
+        }
+        html = handler._render_candidate(
+            scope,
+            candidate,
+            image,
+            annotation=None,
+            recent=[],
+            error="",
+            prev_candidate=None,
+            burst_target_count=0,
+            burst_position=None,
+            queue_position=(1, 4),
+            unreviewed_images=4,
+            unreviewed_candidates=4,
+            suggestion=None,
+            estimated_subject_box_size=None,
+            suggestion_status=None,
+            prefill_selected_truth_label="",
+            prefill_label_input="",
+            prefill_stress=False,
+            prefill_notes="",
+            stress_reason="",
+        )
+        self.assertIn("Type common or scientific name", html)
+        self.assertIn("Type a common or scientific name", html)
 
 
 if __name__ == "__main__":

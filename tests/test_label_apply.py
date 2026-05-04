@@ -7,6 +7,7 @@ from unittest.mock import Mock, call, patch
 from src.label_apply import (
     SpeciesLabel,
     apply_catalog_species_label,
+    existing_flat_tags_from_log,
     flat_keywords_for_label,
     write_sidecar_species_labels,
 )
@@ -77,6 +78,39 @@ class ApplyCatalogSpeciesLabelTest(unittest.TestCase):
             flat_keywords_for_label(label),
             [
                 "Bald Eagle",
+                "Accipitriformes",
+                "Accipitridae",
+                "Haliaeetus leucocephalus",
+            ],
+        )
+
+    def test_existing_flat_tags_from_log_dedupes_and_preserves_order(self) -> None:
+        clf_log = Mock()
+        clf_log.get_all_rows.return_value = [
+            {
+                "image_id": 123,
+                "common_name": "Bald Eagle",
+                "sci_name": "Haliaeetus leucocephalus",
+                "label": "00419_Animalia_Chordata_Aves_Accipitriformes_Accipitridae_Haliaeetus_leucocephalus",
+            },
+            {
+                "image_id": 123,
+                "common_name": "Bald Eagle",
+                "sci_name": "Haliaeetus leucocephalus",
+                "label": "00419_Animalia_Chordata_Aves_Accipitriformes_Accipitridae_Haliaeetus_leucocephalus",
+            },
+            {
+                "image_id": 999,
+                "common_name": "Osprey",
+                "sci_name": "Pandion haliaetus",
+                "label": "99999_Animalia_Chordata_Aves_Accipitriformes_Pandionidae_Pandion_haliaetus",
+            },
+        ]
+        self.assertEqual(
+            existing_flat_tags_from_log(clf_log, 123),
+            [
+                "Bald Eagle",
+                "Hawks-Eagles-Kites-Allies",
                 "Accipitriformes",
                 "Accipitridae",
                 "Haliaeetus leucocephalus",

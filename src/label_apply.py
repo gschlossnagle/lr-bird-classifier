@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+from .ebird_taxonomy import is_ebird_label
 from .taxonomy import get_order_display_name, parse_label
 from .xmp_writer import clean_xmp_keywords, write_bird_keywords
 
@@ -50,9 +51,13 @@ def species_label_from_taxonomy(
     label: str,
 ) -> SpeciesLabel:
     """Build a normalized label payload from a resolved taxonomy label."""
-    parsed = parse_label(label)
-    order = parsed.get("order", "")
-    family = parsed.get("family", "")
+    if is_ebird_label(label):
+        order = ""
+        family = ""
+    else:
+        parsed = parse_label(label)
+        order = parsed.get("order", "")
+        family = parsed.get("family", "")
     return SpeciesLabel(
         common_name=common_name,
         sci_name=sci_name,
@@ -75,6 +80,37 @@ def flat_keywords_for_label(label: SpeciesLabel) -> list[str]:
             ]
         )
     )
+
+
+def existing_flat_tags_from_log(clf_log, image_id: int) -> list[str]:
+    """Build the managed flat-keyword set for an image from classification-log rows."""
+    try:
+        rows = clf_log.get_all_rows()
+    except Exception:
+        return []
+
+    flat: list[str] = []
+    try:
+        iterator = iter(rows)
+    except TypeError:
+        return []
+
+    for row in iterator:
+        if row["image_id"] != image_id:
+            continue
+        parsed = parse_label(row.get("label") or "")
+        order_raw = parsed.get("order", "")
+        order_disp = get_order_display_name(order_raw) if order_raw else ""
+        flat.extend(
+            [
+                row.get("common_name") or "",
+                order_disp,
+                order_raw,
+                parsed.get("family", ""),
+                row.get("sci_name") or "",
+            ]
+        )
+    return list(dict.fromkeys(v for v in flat if v))
 
 
 def managed_keyword_names_for_labels(
@@ -124,12 +160,13 @@ def apply_catalog_species_label(
     top_id = cat.ensure_bird_species_keyword(label.common_name)
     newly_tagged = cat.tag_image(image_id, top_id)
 
-    order_id, keyword_id = cat.ensure_species_keyword(
-        label.order_display or label.order,
-        label.common_name,
-    )
-    cat.tag_image(image_id, keyword_id)
-    cat.tag_image(image_id, order_id)
+    if label.order_display or label.order:
+        order_id, keyword_id = cat.ensure_species_keyword(
+            label.order_display or label.order,
+            label.common_name,
+        )
+        cat.tag_image(image_id, keyword_id)
+        cat.tag_image(image_id, order_id)
 
     if label.order and label.family and label.sci_name:
         sci_ids = cat.ensure_scientific_keywords(

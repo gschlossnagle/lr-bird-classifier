@@ -16,7 +16,12 @@ from .catalog_extract import Detection
 from .classification_log import ClassificationLog
 from .classifier import Classifier
 from .geo_filter import GeoFilter, normalize_region, resolve_region_from_coords
-from .label_apply import replace_catalog_species_labels, species_label_from_prediction, write_sidecar_species_labels
+from .label_apply import (
+    existing_flat_tags_from_log,
+    replace_catalog_species_labels,
+    species_label_from_prediction,
+    write_sidecar_species_labels,
+)
 from .raw_utils import load_image
 from .review_app import ReviewAppHandler, load_label_inventory
 from .review_apply import ApplyEngine, ApplyPolicy
@@ -393,6 +398,7 @@ def main() -> int:
                         if img.id_local in retag_candidates:
                             cat.remove_auto_classifications(img.id_local)
                         label_payloads = _auto_apply_labels(confident)
+                        existing_flat = existing_flat_tags_from_log(clf_log, img.id_local)
                         replace_catalog_species_labels(
                             cat,
                             img.id_local,
@@ -403,7 +409,8 @@ def main() -> int:
                         write_sidecar_species_labels(
                             image_path,
                             label_payloads,
-                            replace_existing=img.id_local in retag_candidates,
+                            replace_existing=True,
+                            flat_to_remove=existing_flat,
                         )
                         clf_log.record(img.id_local, confident, clf_model_str)
                     auto_applied += 1
