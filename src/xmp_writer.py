@@ -73,22 +73,32 @@ def write_bird_keywords(
 
     # Flat keyword names — deduplicated, order preserved
     flat: list[str] = list(dict.fromkeys([
-        common_name,
-        order_display,
-        order,
-        family,
-        sci_name,
+        value for value in [
+            common_name,
+            order_display,
+            order,
+            family,
+            sci_name,
+        ] if value
     ]))
 
     # Hierarchical paths — mirrors the LR keyword hierarchy we write to catalog
-    hier: list[str] = [
-        f"Bird-Species|{common_name}",
-        f"Birds|Order|{order_display}",
-        f"Birds|Order|{order_display}|{common_name}",
-        f"Birds|Scientific|{order}",
-        f"Birds|Scientific|{order}|{family}",
-        f"Birds|Scientific|{order}|{family}|{sci_name}",
-    ]
+    hier: list[str] = [f"Bird-Species|{common_name}"]
+    if order_display:
+        hier.extend(
+            [
+                f"Birds|Order|{order_display}",
+                f"Birds|Order|{order_display}|{common_name}",
+            ]
+        )
+    if order and family and sci_name:
+        hier.extend(
+            [
+                f"Birds|Scientific|{order}",
+                f"Birds|Scientific|{order}|{family}",
+                f"Birds|Scientific|{order}|{family}|{sci_name}",
+            ]
+        )
 
     # Only update an existing sidecar; never create one from scratch.
     if not xmp.exists():

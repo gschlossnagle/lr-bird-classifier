@@ -245,6 +245,34 @@ def load_label_inventory(path: str | Path) -> list[str]:
     return list(dict.fromkeys(labels))
 
 
+AGGREGATE_SCOPE_KEY_PREFIX = "__aggregate__:"
+
+
+def _aggregate_scope_key(catalog_path: str, trip_folder: str) -> str:
+    payload = {
+        "catalog_path": str(Path(catalog_path).resolve()),
+        "trip_folder": str(Path(trip_folder).resolve()),
+    }
+    return AGGREGATE_SCOPE_KEY_PREFIX + json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _parse_aggregate_scope_key(scope_key: str | None) -> dict[str, str] | None:
+    if not scope_key or not scope_key.startswith(AGGREGATE_SCOPE_KEY_PREFIX):
+        return None
+    try:
+        payload = json.loads(scope_key.removeprefix(AGGREGATE_SCOPE_KEY_PREFIX))
+    except json.JSONDecodeError:
+        return None
+    catalog_path = payload.get("catalog_path")
+    trip_folder = payload.get("trip_folder")
+    if not catalog_path or not trip_folder:
+        return None
+    return {
+        "catalog_path": str(Path(catalog_path).resolve()),
+        "trip_folder": str(Path(trip_folder).resolve()),
+    }
+
+
 def _html_page(title: str, body: str) -> bytes:
     doc = f"""<!doctype html>
 <html>
@@ -457,6 +485,97 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
             return {"save", "skip"}
         return {"save", "save_burst", "skip", "reject", "unsure", "not_a_bird", "bad_crop", "duplicate"}
 
+    @staticmethod
+    def _scope_member_keys(scope: dict[str, Any] | None) -> tuple[str, ...]:
+        if scope is None:
+            return ()
+        scope_keys = scope.get("scope_keys")
+        if scope_keys:
+            return tuple(str(value) for value in scope_keys if value)
+        scope_key = scope.get("scope_key")
+        return (str(scope_key),) if scope_key else ()
+
+    @staticmethod
+    def _is_aggregate_scope(scope: dict[str, Any] | None) -> bool:
+        return bool(scope and scope.get("scope_kind") == "aggregate")
+
+    def _touch_scope(self, scope: dict[str, Any] | None) -> None:
+        if scope is None:
+            return
+        opened_at = _utc_now()
+        for member_scope_key in self._scope_member_keys(scope):
+            self.store.touch_scope(member_scope_key, opened_at)
+
+    @staticmethod
+    def _aggregate_scope_from_members(scopes: list[dict[str, Any]], *, catalog_path: str, trip_folder: str) -> dict[str, Any] | None:
+        resolved_catalog_path = str(Path(catalog_path).resolve())
+        resolved_trip_folder = str(Path(trip_folder).resolve())
+        member_scopes = [
+            scope for scope in scopes
+            if str(scope.get("catalog_path") or "") == resolved_catalog_path
+            and str(scope.get("trip_folder") or "").startswith(resolved_trip_folder.rstrip("/") + "/")
+        ]
+        if len(member_scopes) < 2:
+            return None
+
+        workflow_types = {str(scope.get("workflow_type") or WORKFLOW_DETECTOR_REVIEW) for scope in member_scopes}
+        workflow_type = member_scopes[0].get("workflow_type") if len(workflow_types) == 1 else WORKFLOW_DETECTOR_REVIEW
+        created_at = min(str(scope.get("created_at") or "") for scope in member_scopes)
+        last_opened_values = [str(scope.get("last_opened_at") or "") for scope in member_scopes if scope.get("last_opened_at")]
+        return {
+            "scope_key": _aggregate_scope_key(resolved_catalog_path, resolved_trip_folder),
+            "scope_keys": [str(scope["scope_key"]) for scope in member_scopes],
+            "scope_kind": "aggregate",
+            "scope_name": f"{member_scopes[0].get('catalog_name') or Path(resolved_catalog_path).stem} / {resolved_trip_folder}",
+            "catalog_name": member_scopes[0].get("catalog_name") or Path(resolved_catalog_path).stem,
+            "catalog_path": resolved_catalog_path,
+            "trip_folder": resolved_trip_folder,
+            "workflow_type": workflow_type,
+            "created_at": created_at,
+            "last_opened_at": max(last_opened_values) if last_opened_values else None,
+            "status": "aggregate",
+            "notes": f"Aggregates {len(member_scopes)} child scopes",
+            "image_count": sum(int(scope.get("image_count") or 0) for scope in member_scopes),
+            "candidate_count": sum(int(scope.get("candidate_count") or 0) for scope in member_scopes),
+            "unreviewed_image_count": sum(int(scope.get("unreviewed_image_count") or 0) for scope in member_scopes),
+            "unreviewed_count": sum(int(scope.get("unreviewed_count") or 0) for scope in member_scopes),
+            "reviewed_count": sum(int(scope.get("reviewed_count") or 0) for scope in member_scopes),
+            "member_scope_count": len(member_scopes),
+        }
+
+    @classmethod
+    def _aggregate_scopes(cls, scopes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        aggregates: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+
+        for scope in scopes:
+            trip_folder = str(scope.get("trip_folder") or "")
+            catalog_path = str(scope.get("catalog_path") or "")
+            if not trip_folder.startswith("/"):
+                continue
+            parent = str(Path(trip_folder).parent)
+            if parent == trip_folder:
+                continue
+            groups.setdefault((catalog_path, parent), []).append(scope)
+
+        for (catalog_path, parent), members in groups.items():
+            if len(members) < 2 or (catalog_path, parent) in seen:
+                continue
+            aggregate = cls._aggregate_scope_from_members(scopes, catalog_path=catalog_path, trip_folder=parent)
+            if aggregate is None:
+                continue
+            aggregates.append(aggregate)
+            seen.add((catalog_path, parent))
+
+        aggregates.sort(
+            key=lambda scope: (
+                str(scope.get("catalog_name") or ""),
+                str(scope.get("trip_folder") or ""),
+            )
+        )
+        return aggregates
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path in {"/", "/review"}:
@@ -489,7 +608,7 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
             self.send_header("Location", "/scopes")
             self.end_headers()
             return
-        self.store.touch_scope(scope["scope_key"], _utc_now())
+        self._touch_scope(scope)
         self._maybe_start_background_top_up(scope)
         candidate_id = params.get("id", [None])[0]
         error = params.get("error", [""])[0]
@@ -499,12 +618,17 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
         prefill_notes = params.get("notes", [""])[0]
         stress_reason = params.get("stress_reason", [""])[0]
 
-        queue = ReviewQueue(self.store, QueueFilters(scope_key=scope["scope_key"], review_status="unreviewed"))
+        member_scope_keys = self._scope_member_keys(scope)
+        queue = ReviewQueue(self.store, QueueFilters(scope_keys=member_scope_keys, review_status="unreviewed"))
         if candidate_id is None:
             next_candidate = queue.next_candidate()
             if next_candidate is None:
                 status = self._top_up_status()
-                if self.topup_runner is not None and self.topup_coordinator is not None:
+                if (
+                    not self._is_aggregate_scope(scope)
+                    and self.topup_runner is not None
+                    and self.topup_coordinator is not None
+                ):
                     if not status["running"]:
                         self.topup_coordinator.ensure_running(self.store, self.topup_runner, scope)
                         status = self._top_up_status()
@@ -533,12 +657,12 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
         image = self.store.get_image(candidate["image_id"]) or {}
         annotation = self.store.get_annotation(candidate_id)
         recent = self.store.recent_labels(limit=5)
-        prev_candidate = self.store.previous_reviewed_candidate(candidate_id, scope_key=scope["scope_key"])
+        prev_candidate = self.store.previous_reviewed_candidate(candidate_id, scope_keys=member_scope_keys)
         burst_targets = self.store.burst_candidates(candidate_id, include_reviewed=False)
         burst_position = self.store.burst_position(candidate_id)
-        queue_position = self.store.queue_position(candidate_id, scope_key=scope["scope_key"], review_status="unreviewed")
-        unreviewed_candidates = self.store.count_candidates(scope_key=scope["scope_key"], review_status="unreviewed")
-        unreviewed_images = self.store.count_candidate_images(scope_key=scope["scope_key"], review_status="unreviewed")
+        queue_position = self.store.queue_position(candidate_id, scope_keys=member_scope_keys, review_status="unreviewed")
+        unreviewed_candidates = self.store.count_candidates(scope_keys=member_scope_keys, review_status="unreviewed")
+        unreviewed_images = self.store.count_candidate_images(scope_keys=member_scope_keys, review_status="unreviewed")
         suggestion = self._build_suggestion(candidate, image, scope)
         estimated_subject_box_size = self._estimated_subject_box_size(candidate, image)
 
@@ -574,11 +698,12 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
             self.send_header("Location", "/scopes")
             self.end_headers()
             return
-        self.store.touch_scope(scope["scope_key"], _utc_now())
+        self._touch_scope(scope)
         self._maybe_start_background_top_up(scope)
-        queue = ReviewQueue(self.store, QueueFilters(scope_key=scope["scope_key"], review_status="unreviewed"))
+        member_scope_keys = self._scope_member_keys(scope)
+        queue = ReviewQueue(self.store, QueueFilters(scope_keys=member_scope_keys, review_status="unreviewed"))
         next_candidate = queue.next_candidate()
-        summary = self.store.summary_counts(scope_key=scope["scope_key"])
+        summary = self.store.summary_counts(scope_keys=member_scope_keys)
         body = self._render_summary(scope, summary, next_candidate["id"] if next_candidate else None, self._top_up_status())
         self._write_html("Review Summary", body)
 
@@ -604,7 +729,8 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
                 )
                 self.topup_coordinator.ensure_running(self.store, self.topup_runner, None)
                 scopes = self.store.list_scopes()
-        body = self._render_scopes(scopes, self._top_up_status())
+        aggregate_scopes = self._aggregate_scopes(scopes)
+        body = self._render_scopes(scopes, aggregate_scopes, self._top_up_status())
         self._write_html("Review Scopes", body)
 
     def _top_up_status(self) -> dict[str, Any]:
@@ -621,6 +747,8 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
         if self.topup_runner is None or self.topup_coordinator is None:
             return
         if scope is None:
+            return
+        if self._is_aggregate_scope(scope):
             return
         unreviewed = self.store.count_candidates(scope_key=scope["scope_key"], review_status="unreviewed")
         status = self._top_up_status()
@@ -712,7 +840,7 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
     def _resolve_label(self, selected_truth_label: str, label_input: str) -> ResolvedLabel:
         if selected_truth_label:
             return self.resolver.resolve_recent_label(selected_truth_label)
-        return self.resolver.resolve_common_name(label_input)
+        return self.resolver.resolve_name(label_input)
 
     @staticmethod
     def _estimated_subject_box_size(candidate: dict[str, Any], image: dict[str, Any]) -> tuple[float, float] | None:
@@ -890,9 +1018,9 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
             else "This workflow labels one image at a time. Save applies only to the current image."
         )
         shortcut_help = (
-            "Type a common name or use a recent label button below. Shortcuts: 0, 1-5, R, T, K, N, P, F. Label accepts default to burst apply when eligible."
+            "Type a common or scientific name, or use a recent label button below. Shortcuts: 0, 1-5, R, T, K, N, P, F. Label accepts default to burst apply when eligible."
             if not is_run_hybrid_review
-            else "Type a common name or use a recent label button below. Shortcuts: 0, 1-5, K, P, F."
+            else "Type a common or scientific name, or use a recent label button below. Shortcuts: 0, 1-5, K, P, F."
         )
         stress_toggle_html = (
             f"""<label class="toggle"><input id="stress-toggle" type="checkbox" name="stress" value="1" {'checked' if prefill_stress else ''}> (T) mark as stress</label>"""
@@ -952,7 +1080,7 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
                     <input id="selected-truth-label" type="hidden" name="selected_truth_label" value="{html.escape(prefill_selected_truth_label)}">
                     <div><strong>Manual label</strong></div>
                     <div class="manual-label-row">
-                      <input class="manual-label-input" type="text" name="label_input" placeholder="Type common name" value="{html.escape(prefill_label_input)}">
+                      <input class="manual-label-input" type="text" name="label_input" placeholder="Type common or scientific name" value="{html.escape(prefill_label_input)}">
                         <div class="form-actions">
                           <div class="form-actions-left">
                             <button class="primary" type="submit">{default_save_label}</button>
@@ -1206,12 +1334,12 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
         )
 
     @staticmethod
-    def _render_scopes(scopes: list[dict[str, Any]], topup_status: dict[str, Any]) -> str:
+    def _render_scope_table(scopes: list[dict[str, Any]], *, aggregate: bool = False) -> str:
         rows = "".join(
             f"""
             <tr>
               <td><strong>{html.escape(scope['scope_name'])}</strong><div class="small">{html.escape(scope['catalog_path'])}</div></td>
-              <td>{html.escape(scope['trip_folder'])}</td>
+              <td>{html.escape(scope['trip_folder'])}{f'<div class="small">{int(scope.get("member_scope_count") or 0)} child scopes</div>' if aggregate else ''}</td>
               <td>{scope.get('unreviewed_count') or 0}</td>
               <td>{scope.get('reviewed_count') or 0}</td>
               <td>{scope.get('candidate_count') or 0}</td>
@@ -1220,6 +1348,17 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
             """
             for scope in scopes
         )
+        return rows
+
+    @classmethod
+    def _render_scopes(
+        cls,
+        scopes: list[dict[str, Any]],
+        aggregate_scopes: list[dict[str, Any]],
+        topup_status: dict[str, Any],
+    ) -> str:
+        aggregate_rows = cls._render_scope_table(aggregate_scopes, aggregate=True)
+        rows = cls._render_scope_table(scopes)
         status = ""
         if topup_status["running"]:
             status = "<div class='resolved'><div><strong>Background extraction running</strong></div></div>"
@@ -1227,10 +1366,18 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
         <div class="wrap">
           <div class="panel full">
             <h2>Review Scopes</h2>
-            <div class="small">Switch between persisted review scopes without restarting the app.</div>
+            <div class="small">Switch between persisted review scopes without restarting the app. Aggregate scopes combine sibling subfolders into one review queue.</div>
             {status}
           </div>
           <div class="panel full">
+            <h3>Aggregate Scopes</h3>
+            <table>
+              <thead><tr><th>Scope</th><th>Parent Folder</th><th>Unreviewed</th><th>Reviewed</th><th>Candidates</th><th></th></tr></thead>
+              <tbody>{aggregate_rows or '<tr><td colspan="6" class="small">No aggregate parent scopes available yet.</td></tr>'}</tbody>
+            </table>
+          </div>
+          <div class="panel full">
+            <h3>Persisted Scopes</h3>
             <table>
               <thead><tr><th>Scope</th><th>Trip Folder</th><th>Unreviewed</th><th>Reviewed</th><th>Candidates</th><th></th></tr></thead>
               <tbody>{rows or '<tr><td colspan="6" class="small">No scopes yet. If automatic top-up is configured, wait for the first batch to populate.</td></tr>'}</tbody>
@@ -1361,6 +1508,13 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
         if not scopes:
             return None
         if scope_key:
+            aggregate_payload = _parse_aggregate_scope_key(scope_key)
+            if aggregate_payload is not None:
+                return self._aggregate_scope_from_members(
+                    scopes,
+                    catalog_path=aggregate_payload["catalog_path"],
+                    trip_folder=aggregate_payload["trip_folder"],
+                )
             return self.store.get_scope(scope_key)
         if len(scopes) == 1:
             return scopes[0]
@@ -1404,7 +1558,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min-stars", type=int, default=None, help="Optional minimum Lightroom rating for automatic top-up")
     p.add_argument(
         "--formats",
-        default="RAW,DNG,JPEG,TIFF,PSD",
+        default="RAW,DNG,JPEG,JPG,TIFF,PSD",
         help="Comma-separated Lightroom file formats to scan during automatic top-up; accepts arbitrary Lightroom fileFormat values",
     )
     p.add_argument("--max-preview-dimension", type=int, default=2048)
