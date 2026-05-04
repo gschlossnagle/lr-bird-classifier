@@ -1244,7 +1244,7 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
         scope_path = str(scope.get("trip_folder") or "")
         scope_leaf = Path(scope_path).name if scope_path else str(scope.get("scope_name") or "")
         compact_scope = f"{scope.get('catalog_name') or ''} / {scope_leaf}".strip(" /")
-        compact_source = source_path_obj.name if source_path_obj else source_path
+        source_display_path = source_path or (str(source_path_obj) if source_path_obj else "")
         tempo = self._tempo_display(scope["scope_key"])
         progress = self._progress_metrics(queue_position)
         notes = prefill_notes or (annotation or {}).get("notes", "")
@@ -1274,7 +1274,7 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
             "allow_stress": allow_stress,
             "allow_burst_apply": allow_burst_apply,
             "compact_scope": compact_scope,
-            "compact_source": compact_source,
+            "source_display_path": source_display_path,
             "tempo": tempo,
             "progress": progress,
             "details_rows": self._build_details_rows(
@@ -1386,9 +1386,9 @@ class ReviewAppHandler(BaseHTTPRequestHandler):
               <div class="mono-label">Scope</div>
               <div class="topbar-value">{html.escape(context["compact_scope"] or str(scope.get("scope_name") or ""))}</div>
             </div>
-            <div class="topbar-stanza copyable-path" title="Click to copy full path" data-copy-path="{html.escape(source_path)}" data-copy-label="{html.escape(context['compact_source'] or 'Unknown file')}">
+            <div class="topbar-stanza copyable-path" title="Click to copy full path" data-copy-path="{html.escape(source_path)}" data-copy-label="{html.escape(context['source_display_path'] or 'Unknown file')}">
               <div class="mono-label">Image</div>
-              <div class="topbar-value">{html.escape(context["compact_source"] or "Unknown file")}</div>
+              <div class="topbar-value">{html.escape(context["source_display_path"] or "Unknown file")}</div>
             </div>
           </div>
           <div class="topbar-right">
