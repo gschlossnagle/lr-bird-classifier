@@ -269,6 +269,51 @@ class ReviewAppTest(unittest.TestCase):
         self.assertNotIn("Reject", html)
         self.assertIn("Bald Eagle", html)
 
+    def test_render_candidate_mentions_common_or_scientific_name(self) -> None:
+        handler = object.__new__(ReviewAppHandler)
+        scope = {
+            "scope_key": "scope_default",
+            "scope_name": "Catalog / Scope",
+            "catalog_name": "Catalog",
+            "trip_folder": "/photos/Scope",
+            "workflow_type": "detector_review",
+        }
+        candidate = {
+            "id": "img_123",
+            "detector_name": "seeded",
+            "detector_confidence": 0.61,
+        }
+        image = {
+            "source_image_path": "/photos/Scope/IMG_0001.ARW",
+            "capture_datetime": "2026-04-29T10:00:00Z",
+            "region_hint": "north_america",
+            "burst_group_id": "",
+        }
+        html = handler._render_candidate(
+            scope,
+            candidate,
+            image,
+            annotation=None,
+            recent=[],
+            error="",
+            prev_candidate=None,
+            burst_target_count=0,
+            burst_position=None,
+            queue_position=(1, 4),
+            unreviewed_images=4,
+            unreviewed_candidates=4,
+            suggestion=None,
+            estimated_subject_box_size=None,
+            suggestion_status=None,
+            prefill_selected_truth_label="",
+            prefill_label_input="",
+            prefill_stress=False,
+            prefill_notes="",
+            stress_reason="",
+        )
+        self.assertIn("Type common or scientific name", html)
+        self.assertIn("Type a common or scientific name", html)
+
 
 if __name__ == "__main__":
     unittest.main()

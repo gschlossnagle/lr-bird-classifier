@@ -25,9 +25,10 @@ log = logging.getLogger(__name__)
 # Seconds between macOS Core Data epoch (Jan 1 2001) and Unix epoch (Jan 1 1970)
 _CORE_DATA_EPOCH_OFFSET = 978307200
 
-# File formats we can run CV classification on
-# Lightroom records both .psd and .psb files with fileFormat = 'PSD'.
-CLASSIFIABLE_FORMATS = {"RAW", "DNG", "JPEG", "TIFF", "PSD"}
+# File formats we can run CV classification on.
+# Lightroom may record JPEG sources as either 'JPEG' or 'JPG', and both
+# .psd and .psb files show up as 'PSD'.
+CLASSIFIABLE_FORMATS = {"RAW", "DNG", "JPEG", "JPG", "TIFF", "PSD"}
 
 # Keyword hierarchy root that our species tags live under
 KEYWORD_ROOT_NAME = "Birds"

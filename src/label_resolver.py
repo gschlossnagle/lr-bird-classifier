@@ -9,10 +9,13 @@ honest: we only resolve to labels the caller has actually made available.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import re
+from pathlib import Path
 from typing import Iterable
 
-from .taxonomy import build_label_map, get_common_name, parse_label
+from .ebird_taxonomy import build_ebird_label, load_ebird_species
+from .taxonomy import CACHE_PATH, build_label_map, get_common_name, parse_label
 
 
 @dataclass(frozen=True)
@@ -44,7 +47,7 @@ class UnknownLabelError(ValueError):
 
 
 class LabelResolver:
-    """Resolve reviewer-entered common names into canonical labels."""
+    """Resolve reviewer-entered common or scientific names into canonical labels."""
 
     def __init__(self, labels: Iterable[str]) -> None:
         labels = list(labels)
@@ -54,6 +57,9 @@ class LabelResolver:
         )
         self._resolved_by_label: dict[str, ResolvedLabel] = {}
         self._labels_by_normalized_name: dict[str, list[ResolvedLabel]] = {}
+        self._known_taxonomy_names = self._load_known_taxonomy_names()
+        self._ebird_resolved_by_label: dict[str, ResolvedLabel] = {}
+        self._ebird_labels_by_normalized_name: dict[str, list[ResolvedLabel]] = {}
 
         for label in labels:
             parsed = parse_label(label)
@@ -76,6 +82,45 @@ class LabelResolver:
                     continue
                 self._labels_by_normalized_name.setdefault(key, []).append(resolved)
 
+        for row in load_ebird_species().values():
+            resolved = ResolvedLabel(
+                truth_common_name=row["common_name"],
+                truth_sci_name=row["sci_name"],
+                truth_label=build_ebird_label(
+                    species_code=row["species_code"],
+                    sci_name=row["sci_name"],
+                ),
+                taxon_class="Aves",
+            )
+            self._ebird_resolved_by_label[resolved.truth_label] = resolved
+            for key in {
+                self._normalize(resolved.truth_common_name),
+                self._normalize(resolved.truth_sci_name),
+                self._normalize_compact(resolved.truth_common_name),
+                self._normalize_compact(resolved.truth_sci_name),
+            }:
+                if not key:
+                    continue
+                self._ebird_labels_by_normalized_name.setdefault(key, []).append(resolved)
+
+    @classmethod
+    def _load_known_taxonomy_names(cls) -> set[str]:
+        names: set[str] = set()
+        cache_path = Path(CACHE_PATH)
+        if not cache_path.exists():
+            return names
+        try:
+            cache = json.loads(cache_path.read_text())
+        except Exception:
+            return names
+        for sci_name, common_name in cache.items():
+            for value in (sci_name, common_name):
+                if not value:
+                    continue
+                names.add(cls._normalize(value))
+                names.add(cls._normalize_compact(value))
+        return names
+
     @staticmethod
     def _normalize(text: str) -> str:
         return " ".join(text.strip().lower().split())
@@ -89,9 +134,12 @@ class LabelResolver:
         try:
             return self._resolved_by_label[label]
         except KeyError as e:
+            ebird_resolved = self._ebird_resolved_by_label.get(label)
+            if ebird_resolved is not None:
+                return ebird_resolved
             raise UnknownLabelError(f"Unknown canonical label '{label}'") from e
 
-    def resolve_common_name(self, query: str) -> ResolvedLabel:
+    def resolve_name(self, query: str) -> ResolvedLabel:
         """
         Resolve a free-text common/scientific name to exactly one canonical label.
 
@@ -104,12 +152,28 @@ class LabelResolver:
         if not matches:
             matches = self._labels_by_normalized_name.get(self._normalize_compact(query), [])
         if not matches:
-            raise UnknownLabelError(
-                f"No label matches '{query}'. Fix the name or enter a scientific name."
-            )
+            matches = self._ebird_labels_by_normalized_name.get(normalized, [])
+        if not matches:
+            matches = self._ebird_labels_by_normalized_name.get(self._normalize_compact(query), [])
+        if not matches:
+            compact = self._normalize_compact(query)
+            message = f"No label matches '{query}'."
+            if normalized in self._known_taxonomy_names or compact in self._known_taxonomy_names:
+                message += " The species is known in taxonomy data but is not present in the loaded label inventory."
+            suggestions = self.suggest(query, limit=5)
+            if suggestions:
+                suggestion_names = ", ".join(resolved.truth_common_name for resolved in suggestions)
+                message += f" Nearby labels in the current inventory: {suggestion_names}."
+            else:
+                message += " Fix the name or load a label inventory that includes it."
+            raise UnknownLabelError(message)
         if len(matches) > 1:
             raise AmbiguousLabelError(query, matches)
         return matches[0]
+
+    def resolve_common_name(self, query: str) -> ResolvedLabel:
+        """Backward-compatible alias for resolving a free-text bird name."""
+        return self.resolve_name(query)
 
     def suggest(self, query: str, limit: int = 10) -> list[ResolvedLabel]:
         """Return likely matches for a partial free-text query."""
@@ -126,14 +190,23 @@ class LabelResolver:
         if exact_compact:
             return exact_compact[:limit]
 
+        ebird_exact = self._ebird_labels_by_normalized_name.get(normalized, [])
+        if ebird_exact:
+            return ebird_exact[:limit]
+
+        ebird_exact_compact = self._ebird_labels_by_normalized_name.get(compact, [])
+        if ebird_exact_compact:
+            return ebird_exact_compact[:limit]
+
         suggestions: list[ResolvedLabel] = []
         seen: set[str] = set()
-        for name, resolved_list in self._labels_by_normalized_name.items():
-            if normalized in name or compact in name:
-                for resolved in resolved_list:
-                    if resolved.truth_label not in seen:
-                        suggestions.append(resolved)
-                        seen.add(resolved.truth_label)
-                        if len(suggestions) >= limit:
-                            return suggestions
+        for index in (self._labels_by_normalized_name, self._ebird_labels_by_normalized_name):
+            for name, resolved_list in index.items():
+                if normalized in name or compact in name:
+                    for resolved in resolved_list:
+                        if resolved.truth_label not in seen:
+                            suggestions.append(resolved)
+                            seen.add(resolved.truth_label)
+                            if len(suggestions) >= limit:
+                                return suggestions
         return suggestions

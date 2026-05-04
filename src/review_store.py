@@ -374,6 +374,37 @@ class ReviewStore:
             ).fetchone()
             return dict(row) if row else None
 
+    @staticmethod
+    def _scope_filter_predicate(
+        *,
+        scope_key: str | None = None,
+        scope_keys: list[str] | tuple[str, ...] | None = None,
+        column: str = "i.scope_key",
+    ) -> tuple[str, list[Any]]:
+        if scope_key is not None and scope_keys is not None:
+            raise ValueError("Pass either scope_key or scope_keys, not both")
+        if scope_keys is not None:
+            normalized = [value for value in scope_keys if value]
+            if not normalized:
+                return "0 = 1", []
+            placeholders = ",".join("?" * len(normalized))
+            return f"{column} IN ({placeholders})", normalized
+        if scope_key is not None:
+            return f"{column} = ?", [scope_key]
+        return "", []
+
+    @staticmethod
+    def _build_where_clause(
+        conditions: list[str],
+        params_groups: list[list[Any] | tuple[Any, ...]],
+    ) -> tuple[str, list[Any]]:
+        filtered_conditions = [condition for condition in conditions if condition]
+        where_clause = f" WHERE {' AND '.join(filtered_conditions)}" if filtered_conditions else ""
+        params: list[Any] = []
+        for group in params_groups:
+            params.extend(group)
+        return where_clause, params
+
     def insert_image(self, row: dict[str, Any]) -> int:
         payload = dict(row)
         if not payload.get("scope_key"):
@@ -727,6 +758,7 @@ class ReviewStore:
         self,
         *,
         scope_key: str | None = None,
+        scope_keys: list[str] | tuple[str, ...] | None = None,
         review_status: str | None = None,
         burst_group_id: str | None = None,
         limit: int | None = None,
@@ -735,18 +767,21 @@ class ReviewStore:
             SELECT c.*
             FROM candidates c
             JOIN images i ON i.id = c.image_id
-            WHERE 1 = 1
         """
-        params: list[Any] = []
-        if scope_key is not None:
-            sql += " AND i.scope_key = ?"
-            params.append(scope_key)
+        conditions: list[str] = []
+        params_groups: list[list[Any] | tuple[Any, ...]] = []
+        scope_predicate, scope_params = self._scope_filter_predicate(scope_key=scope_key, scope_keys=scope_keys)
+        if scope_predicate:
+            conditions.append(scope_predicate)
+            params_groups.append(scope_params)
         if review_status is not None:
-            sql += " AND c.review_status = ?"
-            params.append(review_status)
+            conditions.append("c.review_status = ?")
+            params_groups.append([review_status])
         if burst_group_id is not None:
-            sql += " AND i.burst_group_id = ?"
-            params.append(burst_group_id)
+            conditions.append("i.burst_group_id = ?")
+            params_groups.append([burst_group_id])
+        where_clause, params = self._build_where_clause(conditions, params_groups)
+        sql += where_clause
         sql += " ORDER BY julianday(i.capture_datetime) ASC, i.capture_datetime ASC, c.id ASC"
         if limit is not None:
             sql += " LIMIT ?"
@@ -759,6 +794,7 @@ class ReviewStore:
         self,
         *,
         scope_key: str | None = None,
+        scope_keys: list[str] | tuple[str, ...] | None = None,
         review_status: str | None = None,
         burst_group_id: str | None = None,
     ) -> int:
@@ -766,18 +802,21 @@ class ReviewStore:
             SELECT COUNT(*) AS n
             FROM candidates c
             JOIN images i ON i.id = c.image_id
-            WHERE 1 = 1
         """
-        params: list[Any] = []
-        if scope_key is not None:
-            sql += " AND i.scope_key = ?"
-            params.append(scope_key)
+        conditions: list[str] = []
+        params_groups: list[list[Any] | tuple[Any, ...]] = []
+        scope_predicate, scope_params = self._scope_filter_predicate(scope_key=scope_key, scope_keys=scope_keys)
+        if scope_predicate:
+            conditions.append(scope_predicate)
+            params_groups.append(scope_params)
         if review_status is not None:
-            sql += " AND c.review_status = ?"
-            params.append(review_status)
+            conditions.append("c.review_status = ?")
+            params_groups.append([review_status])
         if burst_group_id is not None:
-            sql += " AND i.burst_group_id = ?"
-            params.append(burst_group_id)
+            conditions.append("i.burst_group_id = ?")
+            params_groups.append([burst_group_id])
+        where_clause, params = self._build_where_clause(conditions, params_groups)
+        sql += where_clause
         with self._lock:
             row = self._conn.execute(sql, params).fetchone()
             return int(row["n"]) if row else 0
@@ -786,21 +825,25 @@ class ReviewStore:
         self,
         *,
         scope_key: str | None = None,
+        scope_keys: list[str] | tuple[str, ...] | None = None,
         review_status: str | None = None,
     ) -> int:
         sql = """
             SELECT COUNT(DISTINCT c.image_id) AS n
             FROM candidates c
             JOIN images i ON i.id = c.image_id
-            WHERE 1 = 1
         """
-        params: list[Any] = []
-        if scope_key is not None:
-            sql += " AND i.scope_key = ?"
-            params.append(scope_key)
+        conditions: list[str] = []
+        params_groups: list[list[Any] | tuple[Any, ...]] = []
+        scope_predicate, scope_params = self._scope_filter_predicate(scope_key=scope_key, scope_keys=scope_keys)
+        if scope_predicate:
+            conditions.append(scope_predicate)
+            params_groups.append(scope_params)
         if review_status is not None:
-            sql += " AND c.review_status = ?"
-            params.append(review_status)
+            conditions.append("c.review_status = ?")
+            params_groups.append([review_status])
+        where_clause, params = self._build_where_clause(conditions, params_groups)
+        sql += where_clause
         with self._lock:
             row = self._conn.execute(sql, params).fetchone()
             return int(row["n"]) if row else 0
@@ -810,6 +853,7 @@ class ReviewStore:
         candidate_id: str,
         *,
         scope_key: str | None = None,
+        scope_keys: list[str] | tuple[str, ...] | None = None,
         review_status: str = "unreviewed",
     ) -> tuple[int, int] | None:
         with self._lock:
@@ -817,12 +861,13 @@ class ReviewStore:
                 SELECT c.id
                 FROM candidates c
                 JOIN images i ON i.id = c.image_id
-                WHERE c.review_status = ?
             """
-            params: list[Any] = [review_status]
-            if scope_key is not None:
-                sql += " AND i.scope_key = ?"
-                params.append(scope_key)
+            scope_predicate, scope_params = self._scope_filter_predicate(scope_key=scope_key, scope_keys=scope_keys)
+            where_clause, params = self._build_where_clause(
+                ["c.review_status = ?", scope_predicate],
+                [[review_status], scope_params],
+            )
+            sql += where_clause
             sql += " ORDER BY julianday(i.capture_datetime) ASC, i.capture_datetime ASC, c.id ASC"
             rows = self._conn.execute(sql, params).fetchall()
             ordered_ids = [row["id"] for row in rows]
@@ -925,7 +970,13 @@ class ReviewStore:
                     break
             return unique
 
-    def previous_reviewed_candidate(self, current_candidate_id: str, *, scope_key: str | None = None) -> dict[str, Any] | None:
+    def previous_reviewed_candidate(
+        self,
+        current_candidate_id: str,
+        *,
+        scope_key: str | None = None,
+        scope_keys: list[str] | tuple[str, ...] | None = None,
+    ) -> dict[str, Any] | None:
         with self._lock:
             current = self._conn.execute(
                 """
@@ -938,24 +989,36 @@ class ReviewStore:
             ).fetchone()
             if current is None:
                 return None
-            row = self._conn.execute(
-                """
-                SELECT c.*
-                FROM candidates c
-                JOIN images i ON i.id = c.image_id
-                WHERE c.review_status = 'reviewed'
-                  AND i.scope_key = ?
-                  AND (
+            effective_scope_keys: list[str] | tuple[str, ...] | None = scope_keys
+            if scope_key is not None:
+                effective_scope_keys = [scope_key]
+            elif effective_scope_keys is None:
+                effective_scope_keys = [current["scope_key"]]
+            scope_predicate, scope_params = self._scope_filter_predicate(scope_keys=effective_scope_keys)
+            where_clause, params = self._build_where_clause(
+                [
+                    "c.review_status = 'reviewed'",
+                    scope_predicate,
+                    """(
                     julianday(i.capture_datetime) < julianday(?)
                     OR (
                       julianday(i.capture_datetime) = julianday(?)
                       AND c.id < ?
                     )
-                  )
+                  )""",
+                ],
+                [scope_params, [current["capture_datetime"], current["capture_datetime"], current["id"]]],
+            )
+            row = self._conn.execute(
+                f"""
+                SELECT c.*
+                FROM candidates c
+                JOIN images i ON i.id = c.image_id
+                {where_clause}
                 ORDER BY julianday(i.capture_datetime) DESC, i.capture_datetime DESC, c.id DESC
                 LIMIT 1
                 """,
-                (scope_key or current["scope_key"], current["capture_datetime"], current["capture_datetime"], current["id"]),
+                params,
             ).fetchone()
             return dict(row) if row else None
 
@@ -1038,17 +1101,21 @@ class ReviewStore:
             count += 1
         return count
 
-    def summary_counts(self, *, scope_key: str | None = None) -> dict[str, Any]:
+    def summary_counts(
+        self,
+        *,
+        scope_key: str | None = None,
+        scope_keys: list[str] | tuple[str, ...] | None = None,
+    ) -> dict[str, Any]:
         with self._lock:
             overview_sql = """
                 SELECT c.review_status, COUNT(*) AS n
                 FROM candidates c
                 JOIN images i ON i.id = c.image_id
             """
-            overview_params: list[Any] = []
-            if scope_key is not None:
-                overview_sql += " WHERE i.scope_key = ?"
-                overview_params.append(scope_key)
+            scope_predicate, scope_params = self._scope_filter_predicate(scope_key=scope_key, scope_keys=scope_keys)
+            where_clause, overview_params = self._build_where_clause([scope_predicate], [scope_params])
+            overview_sql += where_clause
             overview_sql += " GROUP BY c.review_status"
             overview_rows = self._conn.execute(
                 overview_sql,
@@ -1062,10 +1129,9 @@ class ReviewStore:
                 JOIN candidates c ON c.id = a.candidate_id
                 JOIN images i ON i.id = c.image_id
             """
-            outcome_params: list[Any] = []
-            if scope_key is not None:
-                outcome_sql += " WHERE i.scope_key = ?"
-                outcome_params.append(scope_key)
+            scope_predicate, scope_params = self._scope_filter_predicate(scope_key=scope_key, scope_keys=scope_keys)
+            where_clause, outcome_params = self._build_where_clause([scope_predicate], [scope_params])
+            outcome_sql += where_clause
             outcome_sql += " GROUP BY a.annotation_status"
             outcome_rows = self._conn.execute(outcome_sql, outcome_params).fetchall()
             outcomes = {row["annotation_status"]: int(row["n"]) for row in outcome_rows}
@@ -1084,9 +1150,10 @@ class ReviewStore:
                 WHERE a.annotation_status = 'labeled'
             """
             species_params: list[Any] = []
-            if scope_key is not None:
-                species_sql += " AND i.scope_key = ?"
-                species_params.append(scope_key)
+            scope_predicate, scope_params = self._scope_filter_predicate(scope_key=scope_key, scope_keys=scope_keys)
+            if scope_predicate:
+                species_sql += f" AND {scope_predicate}"
+                species_params.extend(scope_params)
             species_sql += """
                 GROUP BY a.truth_label, a.truth_common_name, a.truth_sci_name
                 ORDER BY total_count DESC, truth_common_name ASC

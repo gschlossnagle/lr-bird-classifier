@@ -214,7 +214,12 @@ def main() -> int:
     from src.classification_log import ClassificationLog
     from src.classifier import Classifier
     from src.geo_filter import GeoFilter, normalize_region, resolve_region_from_coords
-    from src.label_apply import apply_catalog_species_label, species_label_from_prediction, write_sidecar_species_labels
+    from src.label_apply import (
+        apply_catalog_species_label,
+        existing_flat_tags_from_log,
+        species_label_from_prediction,
+        write_sidecar_species_labels,
+    )
 
     catalog_path = Path(args.catalog)
     if not catalog_path.exists():
@@ -411,11 +416,17 @@ def main() -> int:
 
                 newly = False
                 label_payloads = [species_label_from_prediction(pred) for pred in confident]
+                existing_flat = existing_flat_tags_from_log(clf_log, img.id_local)
                 for pred in confident:
                     payload = species_label_from_prediction(pred)
                     if apply_catalog_species_label(cat, img.id_local, payload):
                         newly = True
-                write_sidecar_species_labels(path, label_payloads)
+                write_sidecar_species_labels(
+                    path,
+                    label_payloads,
+                    replace_existing=True,
+                    flat_to_remove=existing_flat,
+                )
 
                 # Record all confident predictions in the classification log
                 clf_log.record(img.id_local, confident, clf_model_str)

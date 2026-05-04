@@ -61,7 +61,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--formats",
-        default="RAW,DNG,JPEG,TIFF,PSD",
+        default="RAW,DNG,JPEG,JPG,TIFF,PSD",
         help="Comma-separated Lightroom file formats to scan; accepts arbitrary Lightroom fileFormat values",
     )
     p.add_argument("--max-preview-dimension", type=int, default=2048)

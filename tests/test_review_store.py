@@ -1064,11 +1064,21 @@ class LabelResolverTest(unittest.TestCase):
         resolved = resolver.resolve_common_name("Bald Eagle")
         self.assertEqual(resolved.truth_sci_name, "Haliaeetus leucocephalus")
 
+    def test_resolve_exact_scientific_name(self) -> None:
+        resolver = LabelResolver(
+            [
+                "00419_Animalia_Chordata_Aves_Accipitriformes_Accipitridae_Haliaeetus_leucocephalus",
+                "02286_Animalia_Chordata_Aves_Passeriformes_Hirundinidae_Hirundo_rustica",
+            ]
+        )
+        resolved = resolver.resolve_name("Haliaeetus leucocephalus")
+        self.assertEqual(resolved.truth_common_name, "Bald Eagle")
+
     def test_unknown_name_raises(self) -> None:
         resolver = LabelResolver(
             ["00419_Animalia_Chordata_Aves_Accipitriformes_Accipitridae_Haliaeetus_leucocephalus"]
         )
-        with self.assertRaisesRegex(UnknownLabelError, "Fix the name or enter a scientific name"):
+        with self.assertRaisesRegex(UnknownLabelError, "Fix the name or load a label inventory that includes it"):
             resolver.resolve_common_name("Imaginary Bird")
 
     def test_ambiguous_name_raises(self) -> None:

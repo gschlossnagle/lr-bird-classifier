@@ -32,6 +32,14 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _exit_code_for_summary(summary: dict[str, int], *, dry_run: bool) -> int:
+    if int(summary.get("errors") or 0) > 0:
+        return 1
+    if not dry_run and int(summary.get("conflicts") or 0) > 0:
+        return 2
+    return 0
+
+
 def main() -> int:
     args = parse_args()
     logging.basicConfig(
@@ -70,8 +78,10 @@ def main() -> int:
         )
         summary = engine.run()
 
+    label = "Dry run complete" if args.dry_run else "Apply complete"
     log.info(
-        "Apply complete: considered=%s applied=%s would_apply=%s repaired=%s would_repair=%s verified_skipped=%s conflicts=%s no_label=%s errors=%s",
+        "%s: considered=%s applied=%s would_apply=%s repaired=%s would_repair=%s verified_skipped=%s conflicts=%s no_label=%s errors=%s",
+        label,
         summary["considered"],
         summary["applied"],
         summary["would_apply"],
@@ -82,7 +92,12 @@ def main() -> int:
         summary["no_label"],
         summary["errors"],
     )
-    return 0
+    exit_code = _exit_code_for_summary(summary, dry_run=args.dry_run)
+    if exit_code == 2:
+        log.warning("Apply completed with unresolved conflicts. Re-run with a different policy or resolve the reviewed labels.")
+    elif exit_code == 1:
+        log.error("Apply completed with errors.")
+    return exit_code
 
 
 if __name__ == "__main__":
